@@ -1,4 +1,14 @@
-# test_agent/workflow/nodes/test_fixing.py - Fixed iterative test fixing
+# test_agent/workflow/nodes/test_fixing.py - Enhanced with raw error details
+
+"""
+Enhanced test fixing that passes raw stderr to AI agent for better error analysis.
+
+Key improvements:
+1. Extracts raw stderr from execution results
+2. For assertion errors and exceptions, passes full stderr context to AI
+3. For import errors, continues with structured approach + tools
+4. Better error categorization and context preservation
+"""
 
 import os
 import logging
@@ -25,15 +35,63 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def extract_stderr_from_execution_result(execution_result: str) -> str:
+    """
+    Extract just the stderr portion from execution result.
+
+    Args:
+        execution_result: Full execution result with STDOUT and STDERR sections
+
+    Returns:
+        Just the stderr content, or empty string if not found
+    """
+    if not execution_result:
+        return ""
+
+    # Look for STDERR section
+    stderr_match = re.search(
+        r"STDERR:\n(.*?)(?:\n\nPROCESS INFO:|$)", execution_result, re.DOTALL
+    )
+    if stderr_match:
+        return stderr_match.group(1).strip()
+
+    # Fallback - if no clear STDERR section, return the whole thing
+    # This handles cases where the format might be different
+    return execution_result
+
+
+def extract_stdout_from_execution_result(execution_result: str) -> str:
+    """
+    Extract just the stdout portion from execution result.
+
+    Args:
+        execution_result: Full execution result with STDOUT and STDERR sections
+
+    Returns:
+        Just the stdout content, or empty string if not found
+    """
+    if not execution_result:
+        return ""
+
+    # Look for STDOUT section
+    stdout_match = re.search(
+        r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)", execution_result, re.DOTALL
+    )
+    if stdout_match:
+        return stdout_match.group(1).strip()
+
+    return ""
+
+
 def analyze_test_error(execution_result: str) -> Dict[str, Any]:
     """
-    Analyze a test execution result to determine the type of error.
+    Enhanced error analysis that preserves raw error details.
 
     Args:
         execution_result: Test execution output
 
     Returns:
-        Dictionary with error analysis
+        Dictionary with enhanced error analysis including raw details
     """
     result = {
         "has_syntax_error": False,
@@ -47,10 +105,19 @@ def analyze_test_error(execution_result: str) -> Dict[str, Any]:
         "missing_dependencies": [],
         "failing_imports": [],
         "suggested_actions": [],
+        # New fields for raw error details
+        "raw_stderr": "",
+        "raw_stdout": "",
+        "detailed_error_context": "",
+        "should_use_raw_details": False,
     }
 
     if not execution_result:
         return result
+
+    # Extract raw stderr and stdout
+    result["raw_stderr"] = extract_stderr_from_execution_result(execution_result)
+    result["raw_stdout"] = extract_stdout_from_execution_result(execution_result)
 
     lines = execution_result.split("\n")
 
@@ -92,26 +159,71 @@ def analyze_test_error(execution_result: str) -> Dict[str, Any]:
             ):
                 result["failing_imports"].append(line.strip())
 
+        # For import errors, we can use structured approach
+        result["should_use_raw_details"] = False
+
     # Check for syntax errors
-    if "SyntaxError" in execution_result:
+    elif "SyntaxError" in execution_result:
         result["has_syntax_error"] = True
         result["error_type"] = "SyntaxError"
         result["suggested_actions"].append("fix_syntax")
+        # For syntax errors, raw details are very helpful
+        result["should_use_raw_details"] = True
+        result["detailed_error_context"] = result["raw_stderr"]
 
-    # Check for assertion errors
-    elif "AssertionError" in execution_result:
+    # Check for assertion errors - ENHANCED
+    elif "AssertionError" in execution_result or "assert" in execution_result.lower():
         result["has_assertion_error"] = True
         result["error_type"] = "AssertionError"
         result["suggested_actions"].append("fix_assertion")
+        # For assertion errors, we DEFINITELY need raw details
+        result["should_use_raw_details"] = True
 
-    # Check for other exceptions
+        # Extract detailed assertion context from stderr
+        stderr = result["raw_stderr"]
+        if stderr:
+            result["detailed_error_context"] = stderr
+        else:
+            result["detailed_error_context"] = execution_result
+
+        # Try to extract specific assertion failure details
+        assertion_patterns = [
+            r"assert (.+)",
+            r"AssertionError: (.+)",
+            r"E\s+assert (.+)",  # pytest format
+            r"FAILED.*assert (.+)",
+        ]
+
+        for pattern in assertion_patterns:
+            matches = re.findall(pattern, execution_result, re.IGNORECASE)
+            if matches:
+                result["error_message"] = f"Assertion failed: {matches[0]}"
+                break
+
+    # Check for other exceptions - ENHANCED
     elif any(
         keyword in execution_result for keyword in ["Error:", "Exception:", "Traceback"]
     ):
         result["has_exception"] = True
         if not result["error_type"]:
-            result["error_type"] = "Exception"
+            # Try to extract specific exception type
+            exception_match = re.search(r"(\w+Error): (.+)", execution_result)
+            if exception_match:
+                result["error_type"] = exception_match.group(1)
+                result["error_message"] = exception_match.group(2)
+            else:
+                result["error_type"] = "Exception"
+
         result["suggested_actions"].append("fix_exception")
+        # For other exceptions, raw details are very helpful
+        result["should_use_raw_details"] = True
+
+        # Use stderr if available, otherwise full execution result
+        stderr = result["raw_stderr"]
+        if stderr and len(stderr.strip()) > 0:
+            result["detailed_error_context"] = stderr
+        else:
+            result["detailed_error_context"] = execution_result
 
     return result
 
@@ -169,7 +281,7 @@ async def fix_test_with_iterative_approach(
     max_attempts: int = 5,
 ) -> TestInfo:
     """
-    Attempt to fix a failing test using an iterative approach with tools and LLM.
+    Enhanced test fixing that uses raw error details for better context.
 
     Args:
         test_info: Test information
@@ -194,7 +306,7 @@ async def fix_test_with_iterative_approach(
         return test_info
 
     logger.info(
-        f"Starting iterative fix for test: {test_info.test_path} (attempt {test_info.fix_attempts + 1}/{max_attempts})"
+        f"Starting enhanced iterative fix for test: {test_info.test_path} (attempt {test_info.fix_attempts + 1}/{max_attempts})"
     )
 
     try:
@@ -214,68 +326,97 @@ async def fix_test_with_iterative_approach(
         for iteration in range(3):  # Max 3 iterations per attempt
             logger.info(f"Fix iteration {iteration + 1}/3 for {test_info.test_path}")
 
-            # Analyze the current error
+            # Enhanced error analysis
             error_analysis = analyze_test_error(current_execution_result)
             logger.info(
-                f"Error analysis: {error_analysis.get('error_type')} - {error_analysis.get('missing_dependencies')}"
+                f"Error analysis: {error_analysis.get('error_type')} - Should use raw details: {error_analysis.get('should_use_raw_details')}"
             )
 
-            # Create system prompt that encourages tool usage
-            system_prompt = """
-You are an expert test fixing agent with access to tools that can help resolve test failures.
+            # Create system prompt based on error type
+            if error_analysis.get("has_import_error"):
+                system_prompt = """
+You are an expert test fixing agent with access to tools for resolving import and dependency issues.
 
 Available tools:
 - install_python_package: Install missing Python packages
 - fix_import_statement: Analyze and suggest import fixes  
 - create_mock_dependency: Create mocks for unavailable dependencies
-- run_test_command: Run test commands to verify fixes
 
-Your goal is to fix the failing test by using tools to resolve underlying issues.
+Your goal is to fix import/module errors by using tools to install missing dependencies or create appropriate mocks.
 
-IMPORTANT: 
-- For ImportError/ModuleNotFoundError: Use install_python_package to install missing modules
-- After using tools, I will re-run the test to see if it's fixed
-- Only provide code fixes if tools alone don't solve the problem
+Focus on using tools first, then provide code fixes if needed.
+"""
+            else:
+                system_prompt = """
+You are an expert test fixing agent. I will provide you with detailed error information including the raw stderr output.
+
+Your goal is to analyze the specific error details and fix the test code accordingly.
+
+For assertion errors: Look at the specific assertion that failed and understand why it failed.
+For other exceptions: Analyze the stack trace and exception details to understand the root cause.
+
+Focus on providing accurate code fixes based on the specific error details provided.
 """
 
-            # Create detailed prompt with error analysis
+            # Create detailed prompt - ENHANCED with raw error details
+            if error_analysis.get("should_use_raw_details") and error_analysis.get(
+                "detailed_error_context"
+            ):
+                # Use raw error details for better context
+                error_details_section = f"""
+Raw Error Output (stderr):
+```
+{error_analysis.get('detailed_error_context')}
+```
+
+This is the actual error output from running the test. Please analyze this carefully to understand exactly what went wrong.
+"""
+            else:
+                # Use structured error analysis for import errors
+                error_details_section = f"""
+Error Analysis:
+- Error type: {error_analysis.get('error_type')}
+- Has import error: {error_analysis.get('has_import_error')}
+- Missing dependencies: {error_analysis.get('missing_dependencies')}
+- Suggested actions: {error_analysis.get('suggested_actions')}
+
+Full execution output:
+```
+{current_execution_result}
+```
+"""
+
             user_prompt = f"""
 I need to fix a failing test. Here are the details:
 
 Test file: {os.path.basename(test_info.test_path)}
 Source file: {os.path.basename(test_info.source_file)}
 Fix iteration: {iteration + 1}/3
+Fix attempt: {test_info.fix_attempts + 1}/{max_attempts}
 
-Error Analysis:
-- Error type: {error_analysis.get('error_type')}
-- Has import error: {error_analysis.get('has_import_error')}
-- Has syntax error: {error_analysis.get('has_syntax_error')}
-- Missing dependencies: {error_analysis.get('missing_dependencies')}
-- Suggested actions: {error_analysis.get('suggested_actions')}
+{error_details_section}
 
-Test execution output:
-\`\`\`
-{current_execution_result}
-\`\`\`
+Current test code:
+```python
+{current_content}
+```
 
 Tools already used this attempt: {tools_used_this_attempt}
 
-Please analyze the error and use appropriate tools to fix it. Focus on:
-1. Installing missing packages for ImportError/ModuleNotFoundError
-2. Creating mocks for external dependencies that can't be installed
-3. Fixing import statements
+Please analyze the error and {'use appropriate tools to fix it' if error_analysis.get('has_import_error') else 'provide the corrected test code'}. 
 
-I will re-run the test after you use tools to see if the problem is resolved.
+{'Focus on installing missing packages or creating mocks for import errors.' if error_analysis.get('has_import_error') else 'Focus on understanding the specific failure and fixing the test logic, assertions, or setup.'}
 """
 
             # Use the LLM with tools to analyze and fix
-            if hasattr(llm_provider, "generate_with_tools"):
-                # Get available tools
+            if hasattr(llm_provider, "generate_with_tools") and error_analysis.get(
+                "has_import_error"
+            ):
+                # For import errors, use tools
                 tools = None
                 if hasattr(llm_provider, "get_bound_tools"):
                     tools = llm_provider.get_bound_tools()
 
-                # Use tool-enabled generation
                 response = await llm_provider.generate_with_tools(
                     prompt=user_prompt,
                     tools=tools,
@@ -283,17 +424,25 @@ I will re-run the test after you use tools to see if the problem is resolved.
                     temperature=0.1,
                 )
             else:
-                # Fallback to regular generation with tool-enabled prompt
-                enhanced_prompt = llm_provider.create_tool_calling_prompt(
-                    user_prompt,
-                    "Focus on using tools to fix import errors and missing dependencies.",
-                )
-                response = await llm_provider.generate(
-                    enhanced_prompt,
-                    system_prompt=system_prompt,
-                    temperature=0.1,
-                    use_tools=True,
-                )
+                # For assertion/exception errors, focus on code generation
+                if error_analysis.get("has_import_error"):
+                    enhanced_prompt = llm_provider.create_tool_calling_prompt(
+                        user_prompt,
+                        "Focus on using tools to fix import errors and missing dependencies.",
+                    )
+                    response = await llm_provider.generate(
+                        enhanced_prompt,
+                        system_prompt=system_prompt,
+                        temperature=0.1,
+                        use_tools=True,
+                    )
+                else:
+                    # Direct code fixing for assertion/exception errors
+                    response = await llm_provider.generate(
+                        user_prompt,
+                        system_prompt=system_prompt,
+                        temperature=0.1,
+                    )
 
             # Process the response and record tool calls
             tools_used_in_iteration = []
@@ -344,6 +493,17 @@ I will re-run the test after you use tools to see if the problem is resolved.
                                         package_name
                                     )
 
+            # Process response for code fixes
+            content = ""
+            if isinstance(response, dict):
+                content = (
+                    response.get("content", "")
+                    or response.get("message", "")
+                    or str(response)
+                )
+            else:
+                content = str(response)
+
             # If tools were used, re-run the test to see if it's fixed
             if tools_used_in_iteration:
                 logger.info(
@@ -377,82 +537,63 @@ I will re-run the test after you use tools to see if the problem is resolved.
                     )
                     current_execution_result = updated_test_info.execution_result
                     test_info.execution_result = current_execution_result
-            else:
-                # No tools used - check if LLM provided code fixes
-                content = ""
-                if isinstance(response, dict):
-                    content = (
-                        response.get("content", "")
-                        or response.get("message", "")
-                        or str(response)
+
+            # Check for code fixes in the response
+            code_matches = re.findall(r"```(?:python)?\n(.*?)```", content, re.DOTALL)
+            if code_matches:
+                fixed_code = max(code_matches, key=len).strip()
+
+                # Check if content actually changed
+                if fixed_code.strip() != current_content.strip():
+                    logger.info(f"LLM provided code fixes in iteration {iteration + 1}")
+
+                    # Write fixed code
+                    with open(test_info.test_path, "w") as f:
+                        f.write(fixed_code)
+
+                    current_content = fixed_code
+                    test_info.content = fixed_code
+
+                    # Re-run the test with new code
+                    temp_test_info = TestInfo(
+                        source_file=test_info.source_file,
+                        test_path=test_info.test_path,
+                        content=fixed_code,
+                        status=TestStatus.PENDING,
                     )
-                else:
-                    content = str(response)
 
-                # Extract code block from content
-                code_matches = re.findall(
-                    r"\`\`\`(?:python)?\n(.*?)\`\`\`", content, re.DOTALL
-                )
-                if code_matches:
-                    fixed_code = max(code_matches, key=len).strip()
+                    updated_test_info = await run_test(
+                        temp_test_info, language, state.environment_path
+                    )
 
-                    # Check if content actually changed
-                    if fixed_code.strip() != current_content.strip():
+                    if updated_test_info.status == TestStatus.PASSED:
                         logger.info(
-                            f"LLM provided code fixes in iteration {iteration + 1}"
+                            f"Test FIXED by code changes in iteration {iteration + 1}!"
                         )
-
-                        # Write fixed code
-                        with open(test_info.test_path, "w") as f:
-                            f.write(fixed_code)
-
-                        current_content = fixed_code
-                        test_info.content = fixed_code
-
-                        # Re-run the test with new code
-                        temp_test_info = TestInfo(
-                            source_file=test_info.source_file,
-                            test_path=test_info.test_path,
-                            content=fixed_code,
-                            status=TestStatus.PENDING,
-                        )
-
-                        updated_test_info = await run_test(
-                            temp_test_info, language, state.environment_path
-                        )
-
-                        if updated_test_info.status == TestStatus.PASSED:
-                            logger.info(
-                                f"Test FIXED by code changes in iteration {iteration + 1}!"
-                            )
-                            test_info.status = TestStatus.FIXED
-                            test_info.execution_result = (
-                                updated_test_info.execution_result
-                            )
-                            test_info.fix_attempts += 1
-                            return test_info
-                        else:
-                            logger.info(
-                                f"Test still failing after code changes in iteration {iteration + 1}"
-                            )
-                            current_execution_result = (
-                                updated_test_info.execution_result
-                            )
-                            test_info.execution_result = current_execution_result
+                        test_info.status = TestStatus.FIXED
+                        test_info.execution_result = updated_test_info.execution_result
+                        test_info.fix_attempts += 1
+                        return test_info
                     else:
                         logger.info(
-                            f"No changes suggested by LLM in iteration {iteration + 1}"
+                            f"Test still failing after code changes in iteration {iteration + 1}"
                         )
-                        break
+                        current_execution_result = updated_test_info.execution_result
+                        test_info.execution_result = current_execution_result
                 else:
                     logger.info(
-                        f"No code fixes provided by LLM in iteration {iteration + 1}"
+                        f"No significant changes suggested by LLM in iteration {iteration + 1}"
                     )
-                    if not tools_used_in_iteration:
-                        break  # No tools and no code fixes, exit loop
+                    break
+            else:
+                logger.info(
+                    f"No code fixes provided by LLM in iteration {iteration + 1}"
+                )
+                if not tools_used_in_iteration:
+                    break  # No tools and no code fixes, exit loop
 
         # If we get here, the test is still failing after all iterations
-        logger.info(f"Test still failing after all iterations. Moving to next attempt.")
+        logger.info("Test still failing after all iterations. Moving to next attempt.")
         test_info.fix_attempts += 1
         test_info.error_message = f"Fix attempt {test_info.fix_attempts} failed after {iteration + 1} iterations"
 
@@ -467,7 +608,7 @@ I will re-run the test after you use tools to see if the problem is resolved.
 
 async def fix_tests(state: WorkflowState) -> WorkflowState:
     """
-    Node to fix failing tests using iterative LLM with tools approach.
+    Node to fix failing tests using enhanced iterative LLM approach with raw error details.
 
     Args:
         state: Current workflow state
@@ -477,7 +618,9 @@ async def fix_tests(state: WorkflowState) -> WorkflowState:
     """
     language = state.project.language
 
-    logger.info(f"Starting iterative test fixing phase for language: {language}")
+    logger.info(
+        f"Starting enhanced iterative test fixing phase for language: {language}"
+    )
 
     # Get LLM provider
     if not state.llm or not state.llm.provider:
@@ -610,7 +753,7 @@ async def fix_tests(state: WorkflowState) -> WorkflowState:
 
     # Log summary with tool usage
     tool_summary = state.get_tool_usage_summary()
-    logger.info(f"Iterative test fixing complete in {time_taken:.2f}s")
+    logger.info(f"Enhanced iterative test fixing complete in {time_taken:.2f}s")
     logger.info(
         f"Test results - Passed: {passed}, Fixed: {fixed}, Failed: {failed}, Error: {error}, Skipped: {skipped}"
     )
