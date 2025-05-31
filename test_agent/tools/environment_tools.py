@@ -1,4 +1,4 @@
-# test_agent/tools/environment_tools.py
+# test_agent/tools/environment_tools.py - Enhanced version
 
 import os
 import shutil
@@ -64,12 +64,10 @@ def _setup_python_environment(project_dir: str, env_dir: str) -> Tuple[bool, str
         # Get path to pip
         if os.name == "nt":  # Windows
             pip_path = os.path.join(env_dir, "Scripts", "pip")
-            # python_path = os.path.join(env_dir, "Scripts", "python")
         else:  # Unix/Linux/Mac
             pip_path = os.path.join(env_dir, "bin", "pip")
-            # python_path = os.path.join(env_dir, "bin", "python")
 
-        # Install pytest
+        # Install pytest first
         logger.info(f"Installing pytest in {env_dir}")
         subprocess.run(
             [pip_path, "install", "-U", "pytest"],
@@ -91,14 +89,8 @@ def _setup_python_environment(project_dir: str, env_dir: str) -> Tuple[bool, str
                 )
             except subprocess.CalledProcessError as e:
                 logger.warning(f"Error installing project requirements: {e}")
-                # Continue even if requirements installation fails
-                return (
-                    True,
-                    env_dir,
-                    f"Environment created but some dependencies failed: {e}",
-                )
 
-        # Check for setup.py or pyproject.toml
+        # Check for setup.py or pyproject.toml and install in development mode
         setup_py = os.path.join(project_dir, "setup.py")
         pyproject_toml = os.path.join(project_dir, "pyproject.toml")
 
@@ -180,11 +172,6 @@ def _setup_go_environment(project_dir: str, env_dir: str) -> Tuple[bool, str, st
                 )
             except subprocess.CalledProcessError as e:
                 logger.warning(f"Error downloading Go dependencies: {e}")
-                return (
-                    True,
-                    env_dir,
-                    f"Go environment created but dependency download failed: {e}",
-                )
 
         return True, env_dir, f"Go environment created at {env_dir}"
 
@@ -214,29 +201,63 @@ def install_dependencies(
 
     try:
         if language.lower() == "python":
-            # Get path to pip
+            # Get path to pip in the virtual environment
             if os.name == "nt":  # Windows
                 pip_path = os.path.join(environment_path, "Scripts", "pip")
             else:  # Unix/Linux/Mac
                 pip_path = os.path.join(environment_path, "bin", "pip")
 
-            # Install dependencies
+            # Verify pip exists
+            if not os.path.exists(pip_path):
+                return False, f"pip not found at {pip_path}"
+
+            # Install dependencies one by one to get better error reporting
+            installed = []
+            failed = []
+
             for dependency in dependencies:
                 try:
+                    logger.info(f"Installing {dependency}...")
                     subprocess.run(
                         [pip_path, "install", dependency],
                         check=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
+                        text=True,
                     )
-                except subprocess.CalledProcessError as e:
-                    logger.warning(f"Failed to install {dependency}: {e}")
-                    return False, f"Failed to install {dependency}: {e}"
+                    installed.append(dependency)
+                    logger.info(f"Successfully installed {dependency}")
 
-            return (
-                True,
-                f"Successfully installed {len(dependencies)} Python dependencies",
-            )
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"Failed to install {dependency}: {e.stderr}")
+                    failed.append(dependency)
+
+                    # Try common alternatives for failed packages
+                    alternatives = get_package_alternatives(dependency)
+                    for alt in alternatives:
+                        try:
+                            logger.info(f"Trying alternative {alt} for {dependency}...")
+                            subprocess.run(
+                                [pip_path, "install", alt],
+                                check=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                            installed.append(f"{alt} (alternative for {dependency})")
+                            failed.remove(dependency)
+                            logger.info(f"Successfully installed alternative {alt}")
+                            break
+                        except subprocess.CalledProcessError:
+                            continue
+
+            if installed:
+                success_msg = f"Successfully installed: {', '.join(installed)}"
+                if failed:
+                    success_msg += f"\nFailed to install: {', '.join(failed)}"
+                return len(failed) == 0, success_msg
+            else:
+                return False, f"Failed to install all dependencies: {', '.join(failed)}"
 
         elif language.lower() == "go":
             # Set environment variables
@@ -244,6 +265,9 @@ def install_dependencies(
             env["GOPATH"] = os.path.join(environment_path, "gopath")
 
             # Install dependencies using go get
+            installed = []
+            failed = []
+
             for dependency in dependencies:
                 try:
                     subprocess.run(
@@ -253,11 +277,18 @@ def install_dependencies(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                     )
+                    installed.append(dependency)
                 except subprocess.CalledProcessError as e:
                     logger.warning(f"Failed to install {dependency}: {e}")
-                    return False, f"Failed to install {dependency}: {e}"
+                    failed.append(dependency)
 
-            return True, f"Successfully installed {len(dependencies)} Go dependencies"
+            if installed:
+                success_msg = f"Successfully installed: {', '.join(installed)}"
+                if failed:
+                    success_msg += f"\nFailed to install: {', '.join(failed)}"
+                return len(failed) == 0, success_msg
+            else:
+                return False, f"Failed to install all dependencies: {', '.join(failed)}"
 
         else:
             return False, f"Dependency installation not implemented for {language}"
@@ -265,6 +296,35 @@ def install_dependencies(
     except Exception as e:
         logger.error(f"Error installing dependencies: {e}")
         return False, f"Error installing dependencies: {str(e)}"
+
+
+def get_package_alternatives(package_name: str) -> List[str]:
+    """
+    Get alternative package names for common packages.
+
+    Args:
+        package_name: Original package name
+
+    Returns:
+        List of alternative package names to try
+    """
+    alternatives = {
+        "cv2": ["opencv-python", "opencv-contrib-python"],
+        "PIL": ["Pillow"],
+        "skimage": ["scikit-image"],
+        "sklearn": ["scikit-learn"],
+        "yaml": ["PyYAML"],
+        "bs4": ["beautifulsoup4"],
+        "serial": ["pyserial"],
+        "crypto": ["pycrypto", "pycryptodome"],
+        "dateutil": ["python-dateutil"],
+        "magic": ["python-magic"],
+        "Image": ["Pillow"],
+        "MySQLdb": ["PyMySQL", "mysql-connector-python"],
+        "psycopg2": ["psycopg2-binary"],
+    }
+
+    return alternatives.get(package_name, [])
 
 
 def cleanup_environment(environment_path: str) -> Tuple[bool, str]:
