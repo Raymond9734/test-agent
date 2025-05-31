@@ -40,11 +40,11 @@ class SettingsManager:
         "project": {
             "default_patterns": {
                 "python": {
-                    "location_pattern": "tests_directory",
+                    "location_pattern": "tests_subdirectory",  # Changed from "tests_directory"
                     "naming_convention": "test_prefix",
                 },
                 "go": {
-                    "location_pattern": "same_directory",
+                    "location_pattern": "tests_subdirectory",  # Changed from "same_directory"
                     "package_pattern": "same_package",
                 },
             },
