@@ -1,4 +1,4 @@
-# test_agent/workflow/nodes/test_execution.py
+# test_agent/workflow/nodes/test_execution.py - Fixed with robust environment setup
 
 import os
 import logging
@@ -6,6 +6,7 @@ import time
 import asyncio
 import subprocess
 import tempfile
+import sys
 from typing import Optional, Tuple
 
 from test_agent.workflow import WorkflowState, TestInfo, TestStatus
@@ -14,12 +15,15 @@ from test_agent.workflow import WorkflowState, TestInfo, TestStatus
 logger = logging.getLogger(__name__)
 
 
-def setup_test_environment(language: str) -> Tuple[bool, str, Optional[str]]:
+def setup_test_environment(
+    language: str, force_recreate: bool = False
+) -> Tuple[bool, str, Optional[str]]:
     """
-    Set up the test environment for a specific language.
+    Set up the test environment for a specific language with robust error handling.
 
     Args:
         language: Language name
+        force_recreate: Whether to force recreation of existing environment
 
     Returns:
         Tuple of (success flag, message, environment path or None)
@@ -29,34 +33,127 @@ def setup_test_environment(language: str) -> Tuple[bool, str, Optional[str]]:
             # Create a virtual environment for Python
             venv_dir = os.path.join(tempfile.gettempdir(), "test_agent_venv")
 
-            if not os.path.exists(venv_dir):
-                logger.info(f"Creating Python virtual environment at {venv_dir}")
+            # Remove existing environment if force_recreate or if it's broken
+            if force_recreate and os.path.exists(venv_dir):
+                logger.info(f"Removing existing virtual environment at {venv_dir}")
+                import shutil
 
-                # Use Python's venv module
-                import venv
+                shutil.rmtree(venv_dir, ignore_errors=True)
 
-                venv.create(venv_dir, with_pip=True, clear=True)
+            # Check if environment exists and is functional
+            if os.path.exists(venv_dir):
+                # Check if pip exists
+                pip_path = os.path.join(
+                    venv_dir, "Scripts" if os.name == "nt" else "bin", "pip"
+                )
+                python_path = os.path.join(
+                    venv_dir, "Scripts" if os.name == "nt" else "bin", "python"
+                )
 
-                # Install pytest
-                if os.name == "nt":  # Windows
-                    pip_path = os.path.join(venv_dir, "Scripts", "pip")
-                else:  # Unix/Linux/Mac
-                    pip_path = os.path.join(venv_dir, "bin", "pip")
+                if os.path.exists(pip_path) and os.path.exists(python_path):
+                    logger.info(f"Using existing virtual environment at {venv_dir}")
+                    return (
+                        True,
+                        f"Using existing test environment at {venv_dir}",
+                        venv_dir,
+                    )
+                else:
+                    logger.warning("Existing environment is broken, recreating...")
+                    import shutil
 
+                    shutil.rmtree(venv_dir, ignore_errors=True)
+
+            logger.info(f"Creating new Python virtual environment at {venv_dir}")
+
+            # Create virtual environment using subprocess for better error handling
+            try:
+                # Use current Python interpreter to create venv
                 subprocess.run(
-                    [pip_path, "install", "pytest"],
+                    [sys.executable, "-m", "venv", venv_dir, "--clear"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                )
+
+                logger.info("Virtual environment created successfully")
+
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    f"Failed to create virtual environment: {e.stderr.decode() if e.stderr else str(e)}"
+                )
+                return False, f"Failed to create virtual environment: {str(e)}", None
+            except subprocess.TimeoutExpired:
+                logger.error("Virtual environment creation timed out")
+                return False, "Virtual environment creation timed out", None
+
+            # Verify paths exist
+            if os.name == "nt":  # Windows
+                pip_path = os.path.join(venv_dir, "Scripts", "pip")
+                python_path = os.path.join(venv_dir, "Scripts", "python")
+            else:  # Unix/Linux/Mac
+                pip_path = os.path.join(venv_dir, "bin", "pip")
+                python_path = os.path.join(venv_dir, "bin", "python")
+
+            if not os.path.exists(pip_path):
+                logger.error(f"pip not found at expected path: {pip_path}")
+                return False, f"pip not found at {pip_path}", None
+
+            if not os.path.exists(python_path):
+                logger.error(f"Python not found at expected path: {python_path}")
+                return False, f"Python not found at {python_path}", None
+
+            # Install pytest with better error handling
+            logger.info("Installing pytest in virtual environment")
+            try:
+                result = subprocess.run(
+                    [pip_path, "install", "-U", "pytest"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                    text=True,
+                )
+                logger.info("pytest installed successfully")
+
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    f"Failed to install pytest: {e.stderr if e.stderr else str(e)}"
+                )
+                return False, f"Failed to install pytest: {str(e)}", None
+            except subprocess.TimeoutExpired:
+                logger.error("pytest installation timed out")
+                return False, "pytest installation timed out", None
+
+            # Verify pytest installation
+            try:
+                subprocess.run(
+                    [python_path, "-m", "pytest", "--version"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=10,
+                )
+                logger.info("pytest installation verified")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"pytest verification failed: {str(e)}")
+            except subprocess.TimeoutExpired:
+                logger.warning("pytest verification timed out")
+
+            return True, f"Python test environment created at {venv_dir}", venv_dir
+
+        elif language.lower() == "go":
+            # Go doesn't need a special environment, it uses go test command
+            try:
+                subprocess.run(
+                    ["go", "version"],
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-
-                logger.info("Installed pytest in virtual environment")
-
-            return True, f"Test environment set up at {venv_dir}", venv_dir
-
-        elif language.lower() == "go":
-            # Go doesn't need a special environment, it uses go test command
-            return True, "Using system Go installation for tests", None
+                return True, "Using system Go installation for tests", None
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                return False, "Go is not installed or not in PATH", None
 
         else:
             return False, f"No test environment setup implemented for {language}", None
@@ -71,7 +168,7 @@ async def run_test(
     test_info: TestInfo, language: str, env_path: Optional[str] = None
 ) -> TestInfo:
     """
-    Run a single test with enhanced error capture.
+    Run a single test with enhanced error capture and robust environment handling.
 
     Args:
         test_info: Test information
@@ -105,10 +202,35 @@ async def run_test(
 
         # Get command based on language
         if language.lower() == "python":
+            # Ensure we have a valid environment
+            if not env_path or not os.path.exists(env_path):
+                logger.warning(
+                    f"Environment path invalid: {env_path}, setting up new environment"
+                )
+                success, message, new_env_path = setup_test_environment(
+                    language, force_recreate=True
+                )
+                if not success:
+                    test_info.status = TestStatus.ERROR
+                    test_info.error_message = (
+                        f"Failed to setup test environment: {message}"
+                    )
+                    return test_info
+                env_path = new_env_path
+
             if os.name == "nt":  # Windows
                 python_path = os.path.join(env_path, "Scripts", "python")
             else:  # Unix/Linux/Mac
                 python_path = os.path.join(env_path, "bin", "python")
+
+            # Verify python path exists
+            if not os.path.exists(python_path):
+                logger.error(f"Python interpreter not found at {python_path}")
+                test_info.status = TestStatus.ERROR
+                test_info.error_message = (
+                    f"Python interpreter not found at {python_path}"
+                )
+                return test_info
 
             # Set up environment variables for better Python path resolution
             env = os.environ.copy()
@@ -325,7 +447,7 @@ async def run_test(
 
 async def execute_tests(state: WorkflowState) -> WorkflowState:
     """
-    Node to execute generated tests.
+    Node to execute generated tests with robust environment management.
 
     Args:
         state: Current workflow state
@@ -337,23 +459,31 @@ async def execute_tests(state: WorkflowState) -> WorkflowState:
 
     logger.info(f"Executing tests for language: {language}")
 
-    # Set up test environment
-    success, message, env_path = setup_test_environment(language)
-
-    if not success:
-        error_msg = f"Failed to set up test environment: {message}"
-        logger.error(error_msg)
-        state.errors.append(
-            {
-                "phase": "test_execution",
-                "error": error_msg,
-                "type": "environment_setup_failed",
-            }
+    # Set up test environment with retry logic
+    max_retries = 2
+    for attempt in range(max_retries):
+        success, message, env_path = setup_test_environment(
+            language, force_recreate=(attempt > 0)
         )
-        state.next_phase = "error"
-        return state
 
-    logger.info(message)
+        if success:
+            logger.info(message)
+            state.environment_path = env_path  # Store in state for later use
+            break
+        else:
+            logger.warning(f"Environment setup attempt {attempt + 1} failed: {message}")
+            if attempt == max_retries - 1:
+                error_msg = f"Failed to set up test environment after {max_retries} attempts: {message}"
+                logger.error(error_msg)
+                state.errors.append(
+                    {
+                        "phase": "test_execution",
+                        "error": error_msg,
+                        "type": "environment_setup_failed",
+                    }
+                )
+                state.next_phase = "error"
+                return state
 
     # Start timing
     start_time = time.time()
