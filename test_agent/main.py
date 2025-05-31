@@ -2,7 +2,6 @@
 
 import os
 import sys
-import time
 import asyncio
 import argparse
 import logging
@@ -10,8 +9,8 @@ from typing import Dict, Any, Optional, List
 
 from .workflow import WorkflowState, TestGenerationGraph, TestStatus
 from .workflow.state import ProjectInfo, LLMInfo, MemoryInfo, CacheInfo
-from .language import get_supported_languages, detect_language, get_adapter
-from .llm import list_providers, get_provider
+from .language import get_supported_languages, detect_language
+from .llm import list_providers
 from .memory import MemoryManager, CacheManager
 from .utils.api_utils import (
     get_api_key,
@@ -570,7 +569,6 @@ def main():
     args = parser.parse_args()
 
     # Set up logging
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     setup_logging(
         level=args.log_level.upper(),
         log_file=args.log_file,
@@ -611,36 +609,29 @@ def main():
 
     # Handle cache clearing
     if args.clear_cache or args.clear_all:
-        project_dir = args.project_dir if args.clear_cache else None
-        scope = "all"
-
-        from .memory import CacheManager
-
-        cache_manager = CacheManager(project_dir or "")
-        result = cache_manager.clear_cache(scope)
-
-        print(f"Cleared {result['hashes']} file hashes")
-        print(f"Cleared {result['analysis']} analysis entries")
-        print(f"Cleared {result['template']} template entries")
-        print("Cache cleared successfully")
+        from .utils.cache_utils import clear_project_cache, clear_all_caches
 
         if args.clear_all and not args.project_dir:
+            # Clear all caches and configuration
+            result = clear_all_caches()
             print("All caches cleared")
-
-            # Also clear config if clearing all
-            from pathlib import Path
-
-            config_file = Path.home() / ".test_agent" / "config.json"
-            if config_file.exists():
-                try:
-                    config_file.unlink()
-                    print("Configuration cleared")
-                except IOError:
-                    print("Failed to clear configuration")
-
-        if not args.project_dir:
-            # If just clearing cache with no project, exit
+            print("Configuration cleared")
             return 0
+        else:
+            # Clear cache for specific project
+            project_dir = args.project_dir if args.clear_cache else None
+            if project_dir:
+                project_dir = os.path.abspath(project_dir)
+
+            result = clear_project_cache(project_dir, force_remove=True)
+
+            print(f"Cleared {result['hashes']} file hashes")
+            print(f"Cleared {result['analysis']} analysis entries")
+            print(f"Cleared {result['template']} template entries")
+            print("Cache cleared successfully")
+
+            if not args.project_dir:
+                return 0
 
     # Check project directory
     if not args.project_dir:
