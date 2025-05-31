@@ -120,24 +120,28 @@ class LanguageAdapter(ABC):
         # Skip __init__.py files if they're empty
         if os.path.basename(file_path) == "__init__.py":
             try:
-                # Check if file is empty or only contains comments/whitespace
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    # Skip if the file is empty or only contains comments
-                    if not content or all(
-                        line.strip().startswith("#")
-                        for line in content.splitlines()
-                        if line.strip()
-                    ):
+                # Use safe file reading
+                content = self._safe_read_file(file_path)
+                if content is None:
+                    # If we can't read the file, skip it
+                    return True
 
-                        return True
+                # Skip if the file is empty or only contains comments
+                content = content.strip()
+                if not content or all(
+                    line.strip().startswith("#")
+                    for line in content.splitlines()
+                    if line.strip()
+                ):
+                    return True
             except Exception as e:
-                print(f"Error reading file {file_path}: {e}")
+                print(f"Error during should skip file: {e}")
+                # If we can't analyze it, better to skip it
+                return True
 
         project_dir = self._find_project_root(file_path)
         existing_test = self.find_corresponding_test(file_path, project_dir)
         if existing_test and os.path.exists(existing_test):
-
             return True
 
         return False
