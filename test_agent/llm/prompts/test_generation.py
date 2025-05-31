@@ -27,23 +27,3 @@ Basic test template:
 
 Enhance this template into a complete test file. Return ONLY the complete test code without explanations.
 """
-
-PYTHON_TEST_DOCSTRING_PROMPT = """
-Write a clear docstring for the test function {test_function} that tests {target_function}.
-The docstring should explain:
-1. What functionality is being tested
-2. Any edge cases or specific scenarios being tested
-3. Expected behavior
-
-Use a clear, concise format following Python docstring conventions.
-"""
-
-GO_TEST_COMMENT_PROMPT = """
-Write a clear comment for the test function {test_function} that tests {target_function}.
-The comment should explain:
-1. What functionality is being tested
-2. Any edge cases or specific scenarios being tested
-3. Expected behavior
-
-Use a clear, concise format following Go comment conventions.
-"""
