@@ -55,14 +55,3 @@ def detect_language(project_dir: str) -> Optional[str]:
         The detected language name or None if detection fails
     """
     return LanguageDetector.detect_language(project_dir)
-
-
-def register_adapter(extensions: list, adapter_class: Type[LanguageAdapter]) -> None:
-    """
-    Register a custom language adapter.
-
-    Args:
-        extensions: List of file extensions that this adapter handles
-        adapter_class: The adapter class to register
-    """
-    registry.register(extensions, adapter_class)
