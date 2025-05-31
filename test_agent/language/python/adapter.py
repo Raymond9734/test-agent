@@ -380,32 +380,81 @@ class PythonAdapter(LanguageAdapter):
         except Exception as e:
             return {"file": file_path, "error": str(e)}
 
-    def _detect_test_framework_from_content(self, content: str) -> str:
-        """Detect which test framework is being used in the content"""
-        pytest_indicators = [
-            "import pytest",
-            "from pytest",
-            "@pytest",
-            "pytest.fixture",
-            "pytest.mark",
-            "def test_",
-        ]
+    def _safe_read_file(self, file_path: str) -> Optional[str]:
+        """
+        Safely read a file with multiple encoding attempts.
 
-        unittest_indicators = [
-            "import unittest",
-            "from unittest",
-            "TestCase",
-            "self.assert",
-            "setUp",
-            "tearDown",
-        ]
+        Args:
+            file_path: Path to the file to read
 
-        pytest_score = sum(1 for indicator in pytest_indicators if indicator in content)
-        unittest_score = sum(
-            1 for indicator in unittest_indicators if indicator in content
-        )
+        Returns:
+            File content as string, or None if reading fails
+        """
+        # Try different encodings
+        encodings_to_try = ["utf-8", "latin-1", "cp1252", "iso-8859-1", "utf-16"]
 
-        return "pytest" if pytest_score >= unittest_score else "unittest"
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, "r", encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logger.debug(f"Error reading {file_path} with {encoding}: {str(e)}")
+                continue
+
+        # If all encodings fail, try to read as binary and detect encoding
+        try:
+            import chardet
+
+            with open(file_path, "rb") as f:
+                raw_data = f.read()
+
+            detected = chardet.detect(raw_data)
+            if detected["encoding"]:
+                try:
+                    return raw_data.decode(detected["encoding"])
+                except Exception:
+                    pass
+        except ImportError:
+            # chardet not available
+            pass
+        except Exception:
+            pass
+
+        logger.debug(f"Could not read file {file_path} with any encoding")
+        return None
+
+
+    def check_is_test_file(self, file_path: str) -> bool:
+        """Check if a file is a test file"""
+        file_name = os.path.basename(file_path)
+
+        # Don't consider __init__.py as a test file
+        if file_name == "__init__.py":
+            return False
+
+        # Check if it's a Python file first
+        if not file_name.endswith(".py"):
+            return False
+
+        # Common test file patterns for Python
+        if (
+            file_name.startswith("test_")
+            or file_name.endswith("_test.py")
+            or (
+                file_name.startswith("test") and file_name != "test.py"
+            )  # handles testXXX.py
+        ):
+            return True
+
+        # Check if file is in a directory with "test" in the name
+        dir_path = os.path.dirname(file_path).lower()
+        if "test" in dir_path:
+            # If it's in a test directory, it's likely a test file even without test prefix
+            return True
+
+        return False
 
     def detect_project_structure(self, project_dir: str) -> Dict[str, Any]:
         """Detect project structure, test patterns, and framework information"""
@@ -430,8 +479,8 @@ class PythonAdapter(LanguageAdapter):
                 if self.check_is_test_file(file_name):
                     test_files.append(os.path.join(root, file_name))
 
-        # Analyze test location patterns
-        location_pattern = "tests_directory"  # Default
+        # Analyze test location patterns with preference for tests_subdirectory
+        location_pattern = "tests_subdirectory"  # Default preference
         naming_convention = "test_prefix"  # Default
 
         if test_files:
@@ -450,18 +499,18 @@ class PythonAdapter(LanguageAdapter):
                 # Check location pattern
                 rel_path = os.path.relpath(test_file, project_dir)
                 parts = rel_path.split(os.sep)
+                test_dir_name = os.path.basename(os.path.dirname(test_file)).lower()
 
-                if parts[0].lower() in ["tests", "test"]:
+                # Priority: Check if test file is in a tests subdirectory
+                if test_dir_name in ["tests", "test", "testing"]:
+                    location_counts["tests_subdirectory"] += 1
+                elif parts[0].lower() in ["tests", "test"]:
                     if len(parts) > 2:
                         location_counts["mirror_under_tests"] += 1
                     else:
                         location_counts["tests_directory"] += 1
                 else:
-                    dir_name = os.path.basename(os.path.dirname(test_file)).lower()
-                    if dir_name in ["tests", "test"]:
-                        location_counts["tests_subdirectory"] += 1
-                    else:
-                        location_counts["same_directory"] += 1
+                    location_counts["same_directory"] += 1
 
                 # Check naming pattern
                 file_name = os.path.basename(test_file)
@@ -470,38 +519,68 @@ class PythonAdapter(LanguageAdapter):
                 elif "_test" in file_name:
                     naming_counts["suffix_test"] += 1
 
-            # Determine primary patterns
-            if location_counts:
+            # Determine primary patterns - prioritize tests_subdirectory
+            if location_counts["tests_subdirectory"] > 0:
+                location_pattern = "tests_subdirectory"
+            elif location_counts:
                 location_pattern = max(location_counts.items(), key=lambda x: x[1])[0]
 
             if naming_counts:
                 naming_convention = max(naming_counts.items(), key=lambda x: x[1])[0]
 
+        # If we found test directories but no clear pattern, prefer tests_subdirectory
+        if test_directories and location_pattern not in [
+            "tests_subdirectory",
+            "mirror_under_tests",
+        ]:
+            # Check if any test directories are subdirectories of source dirs
+            for test_dir in test_directories:
+                test_parent = os.path.dirname(test_dir)
+                if test_parent != project_dir:  # It's a subdirectory somewhere
+                    location_pattern = "tests_subdirectory"
+                    break
+
         # Detect test framework
         framework = "pytest"  # Default
-        for test_file in test_files[:5]:  # Check first 5 test files
 
-            with open(test_file, "r") as f:
-                content = f.read()
+        # Check first few test files for framework indicators
+        files_to_check = test_files[:5]  # Check first 5 test files
+
+        for test_file in files_to_check:
+            try:
+                # Use safe file reading
+                content = self._safe_read_file(test_file)
+                if content is None:
+                    logger.debug(
+                        f"Skipping framework detection for unreadable file: {test_file}"
+                    )
+                    continue
+
                 detected_framework = self._detect_test_framework_from_content(content)
                 if detected_framework == "unittest":
                     framework = "unittest"
                     break
+            except Exception as e:
+                logger.debug(f"Error detecting framework in {test_file}: {str(e)}")
+                continue
 
-        # Determine primary test directory
+        # Determine primary test directory - prefer existing tests subdirectory
         primary_test_dir = None
-        if test_directories:
-            # Preference for test directories at project root
-            for test_dir in test_directories:
-                if os.path.dirname(test_dir) == project_dir:
-                    primary_test_dir = test_dir
-                    break
 
-            # If no test directory at project root, use the first one
-            if not primary_test_dir:
-                primary_test_dir = test_directories[0]
-        else:
-            # Default to tests/ at project root
+        # First, look for tests directories that are subdirectories of the project dir
+        for test_dir in test_directories:
+            if os.path.dirname(test_dir) == project_dir and os.path.basename(
+                test_dir
+            ).lower() in ["tests", "test"]:
+                primary_test_dir = test_dir
+                break
+
+        # If no direct subdirectory found, use the first test directory
+        if not primary_test_dir and test_directories:
+            primary_test_dir = test_directories[0]
+
+        # Default fallback
+        if not primary_test_dir:
             primary_test_dir = os.path.join(project_dir, "tests")
 
         # Create result
@@ -553,18 +632,25 @@ class PythonAdapter(LanguageAdapter):
             test_filename = f"{source_base}_test{source_ext}"
 
         # Generate path based on location pattern
-        location_pattern = pattern.get(
-            "location_pattern", "tests_subdirectory"
-        )  # Changed default
+        location_pattern = pattern.get("location_pattern", "tests_subdirectory")
 
-        if location_pattern == "same_directory":
-            return os.path.join(os.path.dirname(source_file), test_filename)
+        logger.debug(f"Generating test path for {source_file}")
+        logger.debug(f"Location pattern: {location_pattern}")
+        logger.debug(f"Test directory: {test_directory}")
 
-        elif location_pattern == "tests_subdirectory":
+        if location_pattern == "tests_subdirectory":
             # Create tests subdirectory in the same directory as the source file
-            test_dir = os.path.join(os.path.dirname(source_file), "tests")
+            source_dir = os.path.dirname(source_file)
+            test_dir = os.path.join(source_dir, "tests")
             os.makedirs(test_dir, exist_ok=True)
-            return os.path.join(test_dir, test_filename)
+            result_path = os.path.join(test_dir, test_filename)
+            logger.debug(f"tests_subdirectory: {result_path}")
+            return result_path
+
+        elif location_pattern == "same_directory":
+            result_path = os.path.join(os.path.dirname(source_file), test_filename)
+            logger.debug(f"same_directory: {result_path}")
+            return result_path
 
         elif location_pattern == "mirror_under_tests":
             # Get path relative to project root
@@ -574,21 +660,144 @@ class PythonAdapter(LanguageAdapter):
             # Create mirror directory under test_directory
             mirror_dir = os.path.join(test_directory, rel_dir)
             os.makedirs(mirror_dir, exist_ok=True)
-            return os.path.join(mirror_dir, test_filename)
+            result_path = os.path.join(mirror_dir, test_filename)
+            logger.debug(f"mirror_under_tests: {result_path}")
+            return result_path
 
-        else:  # tests_directory or fallback - but now we prefer tests_subdirectory
-            # Check if we should use tests_subdirectory instead
+        else:  # tests_directory or fallback
             source_dir = os.path.dirname(source_file)
 
-            # If the source file is not in the project root, use tests_subdirectory
+            # If the source file is not in the project root, prefer tests_subdirectory
             if source_dir != project_root:
                 test_dir = os.path.join(source_dir, "tests")
                 os.makedirs(test_dir, exist_ok=True)
-                return os.path.join(test_dir, test_filename)
+                result_path = os.path.join(test_dir, test_filename)
+                logger.debug(f"fallback to tests_subdirectory: {result_path}")
+                return result_path
 
             # Otherwise, use the global test directory for root-level files
             os.makedirs(test_directory, exist_ok=True)
-            return os.path.join(test_directory, test_filename)
+            result_path = os.path.join(test_directory, test_filename)
+            logger.debug(f"global test directory: {result_path}")
+            return result_path
+
+    def _detect_test_framework_from_content(self, content: str) -> str:
+        """Detect which test framework is being used in the content"""
+        # Handle None or empty content
+        if not content:
+            return "pytest"  # Default fallback
+
+        pytest_indicators = [
+            "import pytest",
+            "from pytest",
+            "@pytest",
+            "pytest.fixture",
+            "pytest.mark",
+            "def test_",
+        ]
+
+        unittest_indicators = [
+            "import unittest",
+            "from unittest",
+            "TestCase",
+            "self.assert",
+            "setUp",
+            "tearDown",
+        ]
+
+        pytest_score = sum(1 for indicator in pytest_indicators if indicator in content)
+        unittest_score = sum(
+            1 for indicator in unittest_indicators if indicator in content
+        )
+
+        return "pytest" if pytest_score >= unittest_score else "unittest"
+
+    def _generate_import_statement(
+        self, source_file: str, test_path: str, analysis: Dict[str, Any]
+    ) -> str:
+        """
+        Generate the appropriate import statement for the test file.
+
+        Args:
+            source_file: Path to the source file being tested
+            test_path: Path where the test file will be created
+            analysis: Analysis results containing classes and functions
+
+        Returns:
+            Import statement string
+        """
+        # Extract classes and functions to import
+        classes = [cls["name"] for cls in analysis.get("classes", [])]
+        functions = [func["name"] for func in analysis.get("functions", [])]
+
+        # Combine all imports
+        imports_to_make = classes + functions
+
+        # Get module name from source file
+        source_name = os.path.splitext(os.path.basename(source_file))[0]
+
+        # Find the Python package root by looking for the outermost __init__.py
+        def find_package_root(file_path):
+            """Find the root of the Python package by traversing up directories."""
+            current_dir = os.path.dirname(os.path.abspath(file_path))
+            package_parts = []
+
+            while current_dir and current_dir != "/":
+                if os.path.exists(os.path.join(current_dir, "__init__.py")):
+                    # This directory is part of a package
+                    package_parts.insert(0, os.path.basename(current_dir))
+                    current_dir = os.path.dirname(current_dir)
+                else:
+                    # No __init__.py found, stop here
+                    break
+
+            return package_parts
+
+        # Get the package path from the source file
+        try:
+            package_parts = find_package_root(source_file)
+
+            if package_parts:
+                # Build the full module path
+                module_path = ".".join(package_parts + [source_name])
+
+                # Generate import statement
+                if imports_to_make:
+                    import_list = ", ".join(imports_to_make)
+                    return f"from {module_path} import {import_list}"
+                else:
+                    # Import the module itself if no specific items found
+                    return f"from {module_path} import *"
+            else:
+                # Fallback to relative import if no package structure found
+                # Calculate the relative path from test to source
+                test_dir = os.path.dirname(test_path)
+                source_dir = os.path.dirname(source_file)
+
+                # Check if test is in a subdirectory of source directory
+                if test_dir.startswith(source_dir):
+                    # Test is in a subdirectory (like tests/), use parent import
+                    if imports_to_make:
+                        import_list = ", ".join(imports_to_make)
+                        return f"from ..{source_name} import {import_list}"
+                    else:
+                        return f"from ..{source_name} import *"
+                else:
+                    # Same level or other structure
+                    if imports_to_make:
+                        import_list = ", ".join(imports_to_make)
+                        return f"from .{source_name} import {import_list}"
+                    else:
+                        return f"from .{source_name} import *"
+
+        except Exception as e:
+            logger.debug(f"Error generating import statement: {str(e)}")
+            # Ultimate fallback
+            if imports_to_make:
+                import_list = ", ".join(imports_to_make)
+                return f"from {source_name} import {import_list}"
+            else:
+                return f"from {source_name} import *"
 
     def generate_test_template(
         self,
@@ -602,146 +811,199 @@ class PythonAdapter(LanguageAdapter):
             project_dir = self._find_project_root(source_file)
             pattern = self.detect_project_structure(project_dir)
 
-        module_name = os.path.basename(source_file).replace(".py", "")
+        # Generate test path to determine import structure
+        test_directory = pattern.get("primary_test_dir") or os.path.join(
+            self._find_project_root(source_file), "tests"
+        )
+        test_path = self.generate_test_path(source_file, test_directory, pattern)
+
         framework = pattern.get("framework", "pytest")
         naming_convention = pattern.get("naming_convention", "test_prefix")
 
         if framework == "unittest":
-            return self._get_unittest_template(module_name, analysis, naming_convention)
+            return self._get_unittest_template(
+                source_file, test_path, analysis, naming_convention
+            )
         else:
-            return self._get_pytest_template(module_name, analysis, naming_convention)
+            return self._get_pytest_template(
+                source_file, test_path, analysis, naming_convention
+            )
 
     def _get_pytest_template(
-        self, module_name: str, analysis: Dict[str, Any], naming_convention: str
+        self,
+        source_file: str,
+        test_path: str,
+        analysis: Dict[str, Any],
+        naming_convention: str,
     ) -> str:
         """Generate a pytest-style test template"""
-        template = f"""# Generated test file for {module_name}
-import pytest
-from {module_name} import *
 
-"""
+        # Get module name
+        module_name = os.path.splitext(os.path.basename(source_file))[0]
+
+        # Generate import statement
+        import_statement = self._generate_import_statement(
+            source_file, test_path, analysis
+        )
+
+        template = f"""# Generated test file for {module_name}
+    import pytest
+    from unittest.mock import Mock, patch, MagicMock
+    {import_statement}
+
+
+    """
+
         # Add test functions for classes
         for cls in analysis.get("classes", []):
             if naming_convention in ["test_classes", "mixed"]:
                 template += f"""
-class Test{cls['name']}:
-    def test_{cls['name'].lower()}_initialization(self):
-        \"\"\"Test that {cls['name']} can be initialized.\"\"\"
-        instance = {cls['name']}()
-        assert instance is not None
-"""
+    class Test{cls['name']}:
+        def test_{cls['name'].lower()}_initialization(self):
+            \"\"\"Test that {cls['name']} can be initialized.\"\"\"
+            # TODO: Add appropriate initialization parameters
+            # instance = {cls['name']}()
+            # assert instance is not None
+            pass
+    """
                 # Add tests for methods
                 for method in cls.get("methods", []):
                     if method["name"] != "__init__":
                         template += f"""
-    def test_{method['name']}(self):
-        \"\"\"Test the {method['name']} method of {cls['name']}.\"\"\"
-        instance = {cls['name']}()
-        # TODO: Add proper test for {method['name']}
-        # assert instance.{method['name']}() == expected_result
-        pass
-"""
+        def test_{method['name']}(self):
+            \"\"\"Test the {method['name']} method of {cls['name']}.\"\"\"
+            # TODO: Create instance and test {method['name']}
+            # instance = {cls['name']}()
+            # result = instance.{method['name']}()
+            # assert result == expected_result
+            pass
+    """
             else:
                 # Add function-style tests for class methods
                 template += f"""
-def test_{cls['name'].lower()}_initialization():
-    \"\"\"Test that {cls['name']} can be initialized.\"\"\"
-    instance = {cls['name']}()
-    assert instance is not None
-"""
+    def test_{cls['name'].lower()}_initialization():
+        \"\"\"Test that {cls['name']} can be initialized.\"\"\"
+        # TODO: Add appropriate initialization parameters
+        # instance = {cls['name']}()
+        # assert instance is not None
+        pass
+    """
                 # Add tests for methods
                 for method in cls.get("methods", []):
                     if method["name"] != "__init__":
                         template += f"""
-def test_{cls['name'].lower()}_{method['name']}():
-    \"\"\"Test the {method['name']} method of {cls['name']}.\"\"\"
-    instance = {cls['name']}()
-    # TODO: Add proper test for {method['name']}
-    # assert instance.{method['name']}() == expected_result
-    pass
-"""
+    def test_{cls['name'].lower()}_{method['name']}():
+        \"\"\"Test the {method['name']} method of {cls['name']}.\"\"\"
+        # TODO: Create instance and test {method['name']}
+        # instance = {cls['name']}()
+        # result = instance.{method['name']}()
+        # assert result == expected_result
+        pass
+    """
 
         # Add test functions for standalone functions
         for func in analysis.get("functions", []):
             template += f"""
-def test_{func['name']}():
-    \"\"\"Test the {func['name']} function.\"\"\"
-    # TODO: Add proper test for {func['name']}
-    # result = {func['name']}()
-    # assert result == expected_value
-    pass
-"""
+    def test_{func['name']}():
+        \"\"\"Test the {func['name']} function.\"\"\"
+        # TODO: Add proper test for {func['name']}
+        # result = {func['name']}()
+        # assert result == expected_value
+        pass
+    """
+
+        # Add parametrized test example if there are functions
+        if analysis.get("functions") or analysis.get("classes"):
+            template += """
+
+    # Example parametrized test - remove if not needed
+    @pytest.mark.parametrize("input_value,expected", [
+        ("test_input", "expected_output"),
+        # Add more test cases here
+    ])
+    def test_parametrized_example(input_value, expected):
+        \"\"\"Example of parametrized test.\"\"\"
+        # TODO: Replace with actual test logic
+        # result = your_function(input_value)
+        # assert result == expected
+        pass
+    """
 
         return template
 
     def _get_unittest_template(
-        self, module_name: str, analysis: Dict[str, Any], naming_convention: str
+        self,
+        source_file: str,
+        test_path: str,
+        analysis: Dict[str, Any],
+        naming_convention: str,
     ) -> str:
         """Generate a unittest-style test template"""
-        template = f"""# Generated test file for {module_name}
-import unittest
-from {module_name} import *
 
-"""
+        # Get module name
+        module_name = os.path.splitext(os.path.basename(source_file))[0]
+
+        # Generate import statement
+        import_statement = self._generate_import_statement(
+            source_file, test_path, analysis
+        )
+
+        template = f"""# Generated test file for {module_name}
+    import unittest
+    from unittest.mock import Mock, patch, MagicMock
+    {import_statement}
+
+
+    """
+
         # Add test classes for classes
         for cls in analysis.get("classes", []):
-            template += f"""
-class Test{cls['name']}(unittest.TestCase):
-    def test_{cls['name'].lower()}_initialization(self):
-        \"\"\"Test that {cls['name']} can be initialized.\"\"\"
-        instance = {cls['name']}()
-        self.assertIsNotNone(instance)
-"""
+            template += f"""class Test{cls['name']}(unittest.TestCase):
+        def test_{cls['name'].lower()}_initialization(self):
+            \"\"\"Test that {cls['name']} can be initialized.\"\"\"
+            # TODO: Add appropriate initialization parameters
+            # instance = {cls['name']}()
+            # self.assertIsNotNone(instance)
+            pass
+    """
             # Add tests for methods
             for method in cls.get("methods", []):
                 if method["name"] != "__init__":
                     template += f"""
-    def test_{method['name']}(self):
-        \"\"\"Test the {method['name']} method of {cls['name']}.\"\"\"
-        instance = {cls['name']}()
-        # TODO: Add proper test for {method['name']}
-        # result = instance.{method['name']}()
-        # self.assertEqual(result, expected_result)
-        pass
-"""
+        def test_{method['name']}(self):
+            \"\"\"Test the {method['name']} method of {cls['name']}.\"\"\"
+            # TODO: Create instance and test {method['name']}
+            # instance = {cls['name']}()
+            # result = instance.{method['name']}()
+            # self.assertEqual(result, expected_result)
+            pass
+    """
+            template += "\n"
 
         # Add test class for standalone functions
         if analysis.get("functions"):
-            template += f"""
-class Test{module_name.capitalize()}Functions(unittest.TestCase):"""
+            template += (
+                f"""class Test{module_name.capitalize()}Functions(unittest.TestCase):"""
+            )
 
             # Add test methods for standalone functions
             for func in analysis.get("functions", []):
                 template += f"""
-    def test_{func['name']}(self):
-        \"\"\"Test the {func['name']} function.\"\"\"
-        # TODO: Add proper test for {func['name']}
-        # result = {func['name']}()
-        # self.assertEqual(result, expected_value)
-        pass
-"""
+        def test_{func['name']}(self):
+            \"\"\"Test the {func['name']} function.\"\"\"
+            # TODO: Add proper test for {func['name']}
+            # result = {func['name']}()
+            # self.assertEqual(result, expected_value)
+            pass
+    """
+            template += "\n"
 
         template += """
-
-if __name__ == '__main__':
-    unittest.main()
-"""
+    if __name__ == '__main__':
+        unittest.main()
+    """
 
         return template
-
-    def check_is_test_file(self, file_path: str) -> bool:
-        """Check if a file is a test file"""
-        file_name = os.path.basename(file_path)
-
-        if os.path.basename(file_path) == "__init__.py":
-            return True
-
-        # Common test file patterns for Python
-        return (
-            file_name.startswith("test_")
-            or file_name.endswith("_test.py")
-            or "test" in os.path.dirname(file_path).lower()
-        )
 
     def find_corresponding_source(
         self, test_file: str, project_dir: str
@@ -819,10 +1081,10 @@ if __name__ == '__main__':
             f"{file_base}_test.py",  # file_test.py
         ]
 
-        # Check in different locations based on common patterns
+        # Check in different locations based on common patterns, prioritizing tests subdirectory
         potential_locations = [
+            os.path.join(source_dir, "tests"),  # tests/ subdirectory (PRIORITY)
             source_dir,  # Same directory
-            os.path.join(source_dir, "tests"),  # tests/ subdirectory
             os.path.join(source_dir, "test"),  # test/ subdirectory
             os.path.join(project_dir, "tests"),  # tests/ in project root
             os.path.join(project_dir, "test"),  # test/ in project root
