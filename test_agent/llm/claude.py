@@ -1,4 +1,4 @@
-# test_agent/llm/claude.py
+# test_agent/llm/claude.py - Enhanced with tool support
 
 import os
 import json
@@ -15,11 +15,12 @@ logger = logging.getLogger(__name__)
 
 class ClaudeProvider(LLMProvider):
     """
-    Provider for Anthropic's Claude models.
+    Provider for Anthropic's Claude models with enhanced tool support.
     """
 
     def __init__(self):
         """Initialize the Claude provider."""
+        super().__init__()
         self._api_key = None
         self._models = {
             "claude-3-5-sonnet-20240620": {
@@ -53,35 +54,17 @@ class ClaudeProvider(LLMProvider):
     @property
     def default_model(self) -> str:
         """Return the default Claude model."""
-        return "claude-3-5-sonnet-20240620"  # Using the latest model as default
+        return "claude-3-5-sonnet-20240620"
 
     def validate_api_key(self, api_key: str) -> bool:
-        """
-        Validate that the API key is correctly formatted.
-
-        Args:
-            api_key: API key to validate
-
-        Returns:
-            bool: True if the API key is valid, False otherwise
-        """
-        # Claude API keys typically start with 'sk-ant-'
+        """Validate that the API key is correctly formatted."""
         return bool(
             api_key and isinstance(api_key, str) and api_key.startswith("sk-ant-")
         )
 
     def get_llm(self, **kwargs) -> Any:
-        """
-        Return a configured Claude LLM instance.
-
-        Args:
-            **kwargs: Configuration options for the LLM
-
-        Returns:
-            Any: Claude LLM instance
-        """
+        """Return a configured Claude LLM instance."""
         try:
-            # Try to import Anthropic libraries
             from langchain_anthropic import ChatAnthropic
 
             model = kwargs.get("model", self.default_model)
@@ -90,9 +73,7 @@ class ClaudeProvider(LLMProvider):
             api_key = kwargs.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
 
             if not api_key:
-                raise ValueError(
-                    "Anthropic API key is required. Set ANTHROPIC_API_KEY or provide api_key parameter."
-                )
+                raise ValueError("Anthropic API key is required.")
 
             self._api_key = api_key
 
@@ -110,18 +91,39 @@ class ClaudeProvider(LLMProvider):
                         "StreamingStdOutCallbackHandler not available, disabling streaming"
                     )
 
-            return ChatAnthropic(
+            llm = ChatAnthropic(
                 model=model,
                 temperature=temperature,
                 anthropic_api_key=api_key,
                 streaming=streaming,
                 callbacks=callbacks if streaming else None,
             )
+
+            return llm
+
         except ImportError as e:
             logger.error(f"Error importing Anthropic libraries: {e}")
             raise ImportError(
                 "Anthropic integration not available. Please install langchain-anthropic package."
             )
+
+    def create_tool_enabled_llm(self, **kwargs):
+        """Create an LLM instance with tools bound for LangGraph usage."""
+        llm = self.get_llm(**kwargs)
+
+        # If we have bound tools, attach them to the LLM
+        if hasattr(llm, "bind_tools") and self._tools:
+            try:
+                formatted_tools = self.get_bound_tools()
+                if formatted_tools:
+                    llm = llm.bind_tools(formatted_tools)
+                    logger.info(
+                        f"Bound {len(formatted_tools)} tools to Claude LLM instance"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to bind tools to Claude LLM: {str(e)}")
+
+        return llm
 
     async def generate(
         self,
@@ -130,22 +132,41 @@ class ClaudeProvider(LLMProvider):
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
         stream: bool = False,
+        use_tools: bool = False,
         **kwargs,
     ) -> Union[str, Any]:
-        """
-        Generate text using Claude's API directly.
+        """Generate text using Claude's API with optional tool usage."""
+        if use_tools and self._tools:
+            # Use tool-enabled generation
+            tools = self.get_bound_tools()
+            return await self.generate_with_tools(
+                prompt=prompt,
+                tools=tools,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                **kwargs,
+            )
+        else:
+            # Regular generation
+            return await self._generate_without_tools(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=stream,
+                **kwargs,
+            )
 
-        Args:
-            prompt: The prompt to send to Claude
-            system_prompt: Optional system prompt
-            temperature: Temperature setting (0.0 to 1.0)
-            max_tokens: Maximum tokens to generate
-            stream: Whether to stream the response
-            **kwargs: Additional Claude-specific parameters
-
-        Returns:
-            Union[str, Any]: Generated text or stream object
-        """
+    async def _generate_without_tools(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        stream: bool = False,
+        **kwargs,
+    ) -> Union[str, Any]:
+        """Generate text using Claude's API without tools."""
         api_key = (
             kwargs.get("api_key")
             or self._api_key
@@ -186,34 +207,20 @@ class ClaudeProvider(LLMProvider):
                     )
 
                 if stream:
-                    # Return a streaming response
                     return response
                 else:
-                    # Return the completed response text
                     result = await response.json()
                     return result["content"][0]["text"]
 
     async def generate_with_tools(
         self,
         prompt: str,
-        tools: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
         temperature: float = 0.2,
         **kwargs,
     ) -> Dict[str, Any]:
-        """
-        Generate text with tool calling capabilities using Claude.
-
-        Args:
-            prompt: The prompt to send to Claude
-            tools: List of tools available to Claude
-            system_prompt: Optional system prompt
-            temperature: Temperature setting (0.0 to 1.0)
-            **kwargs: Additional Claude-specific parameters
-
-        Returns:
-            Dict[str, Any]: Claude response containing text and/or tool calls
-        """
+        """Generate text with tool calling capabilities using Claude."""
         api_key = (
             kwargs.get("api_key")
             or self._api_key
@@ -224,26 +231,28 @@ class ClaudeProvider(LLMProvider):
 
         model = kwargs.get("model", self.default_model)
 
+        # Use bound tools if none provided
+        if tools is None:
+            tools = self.get_bound_tools()
+
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
 
-        # Format tools for Claude's API
-        formatted_tools = []
-        for tool in tools:
-            formatted_tools.append(self.format_tool_for_provider(tool))
-
         data = {
             "model": model,
             "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
-            "tools": formatted_tools,
+            "max_tokens": 4000,  # Ensure we have enough tokens for tool calls
         }
 
         if system_prompt:
             data["system"] = system_prompt
+
+        if tools:
+            data["tools"] = tools
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -256,18 +265,65 @@ class ClaudeProvider(LLMProvider):
                     )
 
                 result = await response.json()
-                return result
+
+                # Process the response to extract tool calls and content
+                processed_result = self._process_claude_response(result)
+
+                # If there are tool calls, execute them
+                if "tool_calls" in processed_result and processed_result["tool_calls"]:
+                    logger.info(
+                        f"Claude requested {len(processed_result['tool_calls'])} tool calls"
+                    )
+
+                    # Execute tool calls if we have a tool registry
+                    if self._tool_registry:
+                        for tool_call in processed_result["tool_calls"]:
+                            tool_name = tool_call.get("name")
+                            tool_input = self.normalize_tool_input(
+                                tool_name, tool_call.get("input")
+                            )
+
+                            if tool_name:
+                                try:
+                                    tool_result = await self.execute_bound_tool(
+                                        tool_name, tool_input
+                                    )
+                                    tool_call["result"] = tool_result
+                                    logger.info(
+                                        f"Executed tool {tool_name}: {tool_result[:100]}..."
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Error executing tool {tool_name}: {str(e)}"
+                                    )
+                                    tool_call["result"] = f"Error: {str(e)}"
+
+                return processed_result
+
+    def _process_claude_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Process Claude's response to extract tool calls and content."""
+        processed = {"content": "", "tool_calls": []}
+
+        # Extract content from Claude's response format
+        if "content" in response:
+            content_blocks = response["content"]
+
+            for block in content_blocks:
+                if block.get("type") == "text":
+                    processed["content"] += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    # Claude's tool use format
+                    tool_call = {
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "input": block.get("input", {}),
+                    }
+                    processed["tool_calls"].append(tool_call)
+
+        return processed
 
     def format_tool_for_provider(self, tool: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Format a tool definition for Claude's API format.
-
-        Args:
-            tool: Tool definition in standard format
-
-        Returns:
-            Dict[str, Any]: Tool definition formatted for Claude
-        """
+        """Format a tool definition for Claude's API format."""
         return {
             "name": tool.get("name", ""),
             "description": tool.get("description", ""),
@@ -275,96 +331,75 @@ class ClaudeProvider(LLMProvider):
         }
 
     def normalize_tool_input(self, tool_name: str, input_data: Any) -> Any:
-        """
-        Normalize Claude's tool input format.
-
-        Args:
-            tool_name: Name of the tool being called
-            input_data: Tool input in Claude's format
-
-        Returns:
-            Any: Normalized tool input
-        """
+        """Normalize Claude's tool input format."""
         try:
-            # Handle the simple list format [tool_name, args]
-            if isinstance(input_data, list) and len(input_data) >= 2:
-                return input_data[1]
-
-            # Handle Claude's advanced tool_use object format
+            # Handle different input formats from Claude
             if isinstance(input_data, dict):
-                # Check for special tool_use format
-                if input_data.get("type") == "tool_use":
-                    # Extract from partial_json if available
-                    if "partial_json" in input_data:
-                        try:
-                            # Parse the partial_json string
-                            partial_data = json.loads(input_data["partial_json"])
+                # Direct dictionary input - most common case
+                return input_data
 
-                            # Handle the __arg1 pattern
-                            if "__arg1" in partial_data:
-                                # Parse the nested JSON string
-                                return json.loads(partial_data["__arg1"])
+            elif isinstance(input_data, list) and len(input_data) >= 2:
+                # Handle list format [tool_name, args]
+                return (
+                    input_data[1]
+                    if isinstance(input_data[1], dict)
+                    else {"input": input_data[1]}
+                )
 
-                            return partial_data
-                        except json.JSONDecodeError:
-                            # If not valid JSON, return it as is
-                            return input_data["partial_json"]
+            elif isinstance(input_data, str):
+                # Try to parse JSON string
+                try:
+                    return json.loads(input_data)
+                except json.JSONDecodeError:
+                    return {"input": input_data}
 
-                    # Try input field if partial_json isn't available
-                    if "input" in input_data and input_data["input"]:
-                        return input_data["input"]
-
-                # Check if we have "responded" field with list of tool_use objects
-                if "responded" in input_data and isinstance(
-                    input_data["responded"], list
-                ):
-                    for item in input_data["responded"]:
-                        if isinstance(item, dict) and item.get("type") == "tool_use":
-                            # Recursively process this tool_use object
-                            return self.normalize_tool_input(tool_name, item)
-
-            return input_data
+            # Fallback - wrap in dict
+            return {"input": input_data} if input_data is not None else {}
 
         except Exception as e:
-            logger.error(f"Error normalizing Claude input: {str(e)}")
-            return input_data
+            logger.error(
+                f"Error normalizing Claude tool input for {tool_name}: {str(e)}"
+            )
+            return {"input": str(input_data)} if input_data is not None else {}
 
     def normalize_tool_output(self, output_data: Any) -> str:
-        """
-        Normalize Claude's tool output format to ensure it's a string.
+        """Normalize Claude's tool output format to ensure it's a string."""
+        if isinstance(output_data, str):
+            return output_data
 
-        Args:
-            output_data: Tool output data
-
-        Returns:
-            str: Normalized string output
-        """
         try:
-            # If it's already a string, return it
-            if isinstance(output_data, str):
-                return output_data
-
-            # If it's a list with one element that's a string, return that
-            if (
-                isinstance(output_data, list)
-                and len(output_data) == 1
-                and isinstance(output_data[0], str)
-            ):
-                return output_data[0]
-
-            # If it's a list with objects that have 'text' keys, extract and join them
-            if isinstance(output_data, list):
-                texts = []
-                for item in output_data:
-                    if isinstance(item, dict) and "text" in item:
-                        texts.append(item["text"])
-                if texts:
-                    return "".join(texts)
-
-            # Last resort - convert to JSON string
-            return json.dumps(output_data)
-
+            return json.dumps(output_data, indent=2)
         except Exception as e:
-            logger.error(f"Error normalizing Claude output: {str(e)}")
-            # Return a string representation as a fallback
+            logger.error(f"Error normalizing Claude tool output: {str(e)}")
             return str(output_data)
+
+    def create_tool_calling_prompt(self, base_prompt: str, context: str = "") -> str:
+        """Create a prompt that encourages Claude to use tools appropriately."""
+        if not self._tools:
+            return base_prompt
+
+        tool_descriptions = []
+        for tool_name, tool_info in self._tools.items():
+            tool_descriptions.append(
+                f"- {tool_name}: {tool_info.get('description', '')}"
+            )
+
+        enhanced_prompt = f"""
+{base_prompt}
+
+You have access to the following tools that can help solve problems:
+{chr(10).join(tool_descriptions)}
+
+{context}
+
+IMPORTANT: When you encounter issues that these tools can solve, USE THEM! For example:
+- If you see ImportError or ModuleNotFoundError, use install_python_package to install missing packages
+- If you need help with import statements, use fix_import_statement to get suggestions  
+- If external dependencies can't be installed, use create_mock_dependency to create mocks
+- Use run_test_command to verify that fixes work
+
+Don't just suggest what to do - actually use the tools to fix problems. After using tools successfully, then provide the corrected code or solution.
+
+Please proceed with the task and actively use the available tools when they can help.
+"""
+        return enhanced_prompt
