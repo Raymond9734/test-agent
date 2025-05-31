@@ -49,7 +49,7 @@ class GeminiProvider(LLMProvider):
     @property
     def default_model(self) -> str:
         """Return the default Gemini model."""
-        return "gemini-1.5-pro-latest"  # Using the latest model as default
+        return "gemini-2.0-flash"  # Using the latest model as default
 
     def validate_api_key(self, api_key: str) -> bool:
         """
