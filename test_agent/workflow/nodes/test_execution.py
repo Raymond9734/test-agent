@@ -71,7 +71,7 @@ async def run_test(
     test_info: TestInfo, language: str, env_path: Optional[str] = None
 ) -> TestInfo:
     """
-    Run a single test.
+    Run a single test with enhanced error capture.
 
     Args:
         test_info: Test information
@@ -81,13 +81,22 @@ async def run_test(
     Returns:
         Updated test information
     """
+    # DEBUG: Log test execution start
+    logger.debug("=" * 80)
+    logger.debug(f"RUNNING TEST: {test_info.test_path}")
+    logger.debug(f"Source file: {test_info.source_file}")
+    logger.debug(f"Current status: {test_info.status}")
+    logger.debug("=" * 80)
+
     if test_info.status == TestStatus.SKIPPED:
         # Skip existing tests
+        logger.debug("Test is marked as SKIPPED, returning as-is")
         return test_info
 
     if not os.path.exists(test_info.test_path):
         test_info.status = TestStatus.ERROR
         test_info.error_message = f"Test file not found: {test_info.test_path}"
+        logger.debug(f"Test file not found: {test_info.test_path}")
         return test_info
 
     try:
@@ -101,25 +110,83 @@ async def run_test(
             else:  # Unix/Linux/Mac
                 python_path = os.path.join(env_path, "bin", "python")
 
-            # Set up environment variables
+            # Set up environment variables for better Python path resolution
             env = os.environ.copy()
 
-            # Add project directory to PYTHONPATH to allow imports
-            project_dir = os.path.dirname(test_info.source_file)
-            if "PYTHONPATH" in env:
-                if os.name == "nt":  # Windows
-                    env["PYTHONPATH"] = f"{project_dir};{env['PYTHONPATH']}"
-                else:  # Unix/Linux/Mac
-                    env["PYTHONPATH"] = f"{project_dir}:{env['PYTHONPATH']}"
-            else:
-                env["PYTHONPATH"] = project_dir
+            # Get the project root directory (go up from test file to find project root)
+            test_dir = os.path.dirname(test_info.test_path)
+            project_root = os.path.dirname(
+                test_dir
+            )  # Assume tests are in project/tests/
 
-            # Create command
-            command = [python_path, "-m", "pytest", "-v", test_info.test_path]
+            # Also try to find the actual project root by looking for common indicators
+            current_dir = test_dir
+            while current_dir and current_dir != os.path.dirname(current_dir):
+                # Look for setup.py, pyproject.toml, or .git
+                if any(
+                    os.path.exists(os.path.join(current_dir, f))
+                    for f in ["setup.py", "pyproject.toml", ".git", "requirements.txt"]
+                ):
+                    project_root = current_dir
+                    break
+                current_dir = os.path.dirname(current_dir)
+
+            logger.debug(f"Detected project root: {project_root}")
+
+            # Add multiple paths to PYTHONPATH for better import resolution
+            paths_to_add = [
+                project_root,  # Project root
+                os.path.dirname(
+                    test_info.source_file
+                ),  # Directory containing source file
+                test_dir,  # Test directory
+            ]
+
+            # Add parent directories of source file to handle nested packages
+            source_dir = os.path.dirname(test_info.source_file)
+            while (
+                source_dir
+                and source_dir != project_root
+                and source_dir != os.path.dirname(source_dir)
+            ):
+                paths_to_add.append(source_dir)
+                source_dir = os.path.dirname(source_dir)
+
+            # Remove duplicates and join paths
+            unique_paths = []
+            for path in paths_to_add:
+                if path not in unique_paths:
+                    unique_paths.append(path)
+
+            python_path_value = os.pathsep.join(unique_paths)
+
+            if "PYTHONPATH" in env:
+                env["PYTHONPATH"] = (
+                    f"{python_path_value}{os.pathsep}{env['PYTHONPATH']}"
+                )
+            else:
+                env["PYTHONPATH"] = python_path_value
+
+            logger.debug(f"Set PYTHONPATH to: {env['PYTHONPATH']}")
+
+            # Create command with more verbose output
+            command = [
+                python_path,
+                "-m",
+                "pytest",
+                "-v",  # verbose
+                "-s",  # don't capture output
+                "--tb=long",  # long traceback format
+                "--no-header",  # no header
+                test_info.test_path,
+            ]
+
+            # Set working directory to project root for better module resolution
+            work_dir = project_root
 
         elif language.lower() == "go":
             # Get directory containing the test file
-            # test_dir = os.path.dirname(test_info.test_path)
+            work_dir = os.path.dirname(test_info.test_path)
 
             # Create command
             command = ["go", "test", "-v", test_info.test_path]
@@ -132,48 +199,127 @@ async def run_test(
             test_info.error_message = f"No test execution implemented for {language}"
             return test_info
 
+        # DEBUG: Log the command and environment
+        logger.debug(f"Command: {' '.join(command)}")
+        logger.debug(f"Working directory: {work_dir}")
+        logger.debug("Environment variables added:")
+        if language.lower() == "python":
+            logger.debug(f"  PYTHONPATH: {env.get('PYTHONPATH', 'Not set')}")
+
         # Run the test
         logger.info(f"Running test: {test_info.test_path}")
 
-        # Execute the command
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=os.path.dirname(test_info.test_path),
-        )
+        # Execute the command with timeout
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=work_dir,
+            )
 
-        # Get output
-        stdout, stderr = await process.communicate()
+            # Get output with timeout
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                test_info.status = TestStatus.ERROR
+                test_info.error_message = "Test execution timed out after 30 seconds"
+                test_info.execution_result = "Test execution timed out"
+                return test_info
+
+        except Exception as e:
+            test_info.status = TestStatus.ERROR
+            test_info.error_message = f"Failed to start test process: {str(e)}"
+            test_info.execution_result = f"Process execution error: {str(e)}"
+            logger.error(f"Failed to start test process: {str(e)}")
+            return test_info
+
+        # Combine stdout and stderr for full context
+        stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+        stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+        # Create comprehensive execution result
+        execution_result_parts = []
+
+        if stdout_text.strip():
+            execution_result_parts.append(f"STDOUT:\n{stdout_text}")
+
+        if stderr_text.strip():
+            execution_result_parts.append(f"STDERR:\n{stderr_text}")
+
+        if not execution_result_parts:
+            execution_result_parts.append("No output captured")
+
+        # Add process information
+        execution_result_parts.append("\nPROCESS INFO:")
+        execution_result_parts.append(f"Return code: {process.returncode}")
+        execution_result_parts.append(f"Command: {' '.join(command)}")
+        execution_result_parts.append(f"Working directory: {work_dir}")
+
+        execution_result = "\n\n".join(execution_result_parts)
 
         # Store execution result
-        test_info.execution_result = (
-            f"STDOUT:\n{stdout.decode()}\n\nSTDERR:\n{stderr.decode()}"
-        )
+        test_info.execution_result = execution_result
 
-        # Update status based on exit code
+        # DEBUG: Log execution results
+        logger.debug("TEST EXECUTION COMPLETED")
+        logger.debug(f"Return code: {process.returncode}")
+        logger.debug(f"STDOUT length: {len(stdout_text)}")
+        logger.debug(f"STDERR length: {len(stderr_text)}")
+        logger.debug("STDOUT content:")
+        logger.debug(stdout_text[:1000] if stdout_text else "No STDOUT")
+        logger.debug("STDERR content:")
+        logger.debug(stderr_text[:1000] if stderr_text else "No STDERR")
+        logger.debug("=" * 80)
+
+        # Update status based on exit code and output analysis
         if process.returncode == 0:
             test_info.status = TestStatus.PASSED
             logger.info(f"Test passed: {test_info.test_path}")
         else:
-            # Check if it's a test failure (assertion failed) or an error
-            if "AssertionError" in test_info.execution_result:
+            # Analyze the type of failure
+            combined_output = stdout_text + stderr_text
+
+            if any(
+                keyword in combined_output.lower()
+                for keyword in ["importerror", "modulenotfounderror", "no module named"]
+            ):
+                test_info.status = TestStatus.ERROR
+                test_info.error_message = "Import error detected"
+                logger.info(f"Test failed with import error: {test_info.test_path}")
+            elif any(
+                keyword in combined_output.lower()
+                for keyword in ["syntaxerror", "indentationerror"]
+            ):
+                test_info.status = TestStatus.ERROR
+                test_info.error_message = "Syntax error detected"
+                logger.info(f"Test failed with syntax error: {test_info.test_path}")
+            elif any(
+                keyword in combined_output.lower()
+                for keyword in ["assertionerror", "assert", "failed"]
+            ):
                 test_info.status = TestStatus.FAILED
+                test_info.error_message = "Test assertion failed"
                 logger.info(f"Test failed (assertions): {test_info.test_path}")
             else:
                 test_info.status = TestStatus.ERROR
                 test_info.error_message = (
                     f"Test execution error (code {process.returncode})"
                 )
-                logger.info(f"Test error: {test_info.test_path}")
+                logger.info(f"Test error (unknown): {test_info.test_path}")
 
         return test_info
 
     except Exception as e:
         test_info.status = TestStatus.ERROR
         test_info.error_message = f"Error running test: {str(e)}"
+        test_info.execution_result = f"Exception during test execution: {str(e)}"
         logger.error(f"Error running test {test_info.test_path}: {str(e)}")
+        logger.exception("Full exception details:")
         return test_info
 
 
@@ -227,6 +373,14 @@ async def execute_tests(state: WorkflowState) -> WorkflowState:
     }
 
     logger.info(f"Executing {len(tests_to_execute)} tests")
+
+    # DEBUG: Log info about tests to execute
+    logger.debug("TESTS TO EXECUTE:")
+    for source_file, test_info in tests_to_execute.items():
+        logger.debug(f"  {source_file}:")
+        logger.debug(f"    Test path: {test_info.test_path}")
+        logger.debug(f"    Status: {test_info.status}")
+        logger.debug(f"    Has content: {bool(test_info.content)}")
 
     # Run tests in batches to avoid resource issues
     batch_size = 5
