@@ -1,4 +1,4 @@
-# test_agent/workflow/state.py
+# test_agent/workflow/state.py - Enhanced with tool support
 
 from enum import Enum
 from typing import Dict, List, Optional, Any, Set
@@ -15,6 +15,19 @@ class TestStatus(str, Enum):
     ERROR = "error"
     FIXED = "fixed"
     SKIPPED = "skipped"
+
+
+class ToolCall(BaseModel):
+    """Information about a tool call"""
+
+    tool_name: str = Field(..., description="Name of the tool called")
+    tool_input: Dict[str, Any] = Field(..., description="Input parameters to the tool")
+    tool_output: str = Field(..., description="Output from the tool")
+    timestamp: float = Field(..., description="When the tool was called")
+    success: bool = Field(..., description="Whether the tool call was successful")
+    error_message: Optional[str] = Field(
+        None, description="Error message if tool failed"
+    )
 
 
 class FileInfo(BaseModel):
@@ -58,6 +71,12 @@ class TestInfo(BaseModel):
     fix_attempts: int = Field(default=0, description="Number of fix attempts made")
     fix_history: List[str] = Field(
         default_factory=list, description="History of fixes attempted"
+    )
+    tool_calls: List[ToolCall] = Field(
+        default_factory=list, description="Tools used during test generation/fixing"
+    )
+    dependencies_installed: List[str] = Field(
+        default_factory=list, description="Dependencies installed for this test"
     )
 
 
@@ -121,6 +140,27 @@ class ConversationTurn(BaseModel):
     timestamp: float = Field(..., description="Timestamp when the message was created")
 
 
+class ToolUsageInfo(BaseModel):
+    """Information about tool usage during the workflow"""
+
+    tools_available: List[str] = Field(
+        default_factory=list, description="List of available tools"
+    )
+    tools_used: Dict[str, int] = Field(
+        default_factory=dict, description="Count of how many times each tool was used"
+    )
+    total_tool_calls: int = Field(
+        default=0, description="Total number of tool calls made"
+    )
+    successful_tool_calls: int = Field(
+        default=0, description="Number of successful tool calls"
+    )
+    failed_tool_calls: int = Field(default=0, description="Number of failed tool calls")
+    tool_call_history: List[ToolCall] = Field(
+        default_factory=list, description="Complete history of tool calls"
+    )
+
+
 class MemoryInfo(BaseModel):
     """Memory and persistence information"""
 
@@ -133,6 +173,9 @@ class MemoryInfo(BaseModel):
     decisions: Dict[str, Any] = Field(
         default_factory=dict, description="Key decisions made"
     )
+    tool_usage: ToolUsageInfo = Field(
+        default_factory=ToolUsageInfo, description="Tool usage information"
+    )
 
 
 class LLMInfo(BaseModel):
@@ -144,13 +187,16 @@ class LLMInfo(BaseModel):
     streaming: bool = Field(True, description="Whether to use streaming mode")
     temperature: float = Field(0.2, description="Temperature setting")
     max_tokens: Optional[int] = Field(None, description="Maximum tokens setting")
+    tools_enabled: bool = Field(
+        True, description="Whether tools are enabled for this LLM"
+    )
     other_settings: Dict[str, Any] = Field(
         default_factory=dict, description="Other provider-specific settings"
     )
 
 
 class WorkflowState(BaseModel):
-    """Complete state of the test generation workflow"""
+    """Complete state of the test generation workflow with tool support"""
 
     project: ProjectInfo = Field(..., description="Project information")
     tests: Dict[str, TestInfo] = Field(
@@ -179,6 +225,14 @@ class WorkflowState(BaseModel):
         None, description="Current file being processed"
     )
 
+    # Tool-related state
+    tools_registry_initialized: bool = Field(
+        False, description="Whether tools registry is initialized"
+    )
+    environment_path: Optional[str] = Field(
+        None, description="Path to the test environment"
+    )
+
     # Summary information
     start_time: Optional[float] = Field(None, description="Start time of the workflow")
     end_time: Optional[float] = Field(None, description="End time of the workflow")
@@ -188,6 +242,46 @@ class WorkflowState(BaseModel):
     fixed_tests: int = Field(0, description="Number of fixed tests")
     total_files: int = Field(0, description="Total number of files to process")
     is_completed: bool = Field(False, description="Whether the workflow has completed")
+
+    def record_tool_call(self, tool_call: ToolCall):
+        """Record a tool call in the workflow state"""
+        # Add to memory
+        self.memory.tool_usage.tool_call_history.append(tool_call)
+        self.memory.tool_usage.total_tool_calls += 1
+
+        if tool_call.success:
+            self.memory.tool_usage.successful_tool_calls += 1
+        else:
+            self.memory.tool_usage.failed_tool_calls += 1
+
+        # Update tool usage count
+        if tool_call.tool_name in self.memory.tool_usage.tools_used:
+            self.memory.tool_usage.tools_used[tool_call.tool_name] += 1
+        else:
+            self.memory.tool_usage.tools_used[tool_call.tool_name] = 1
+
+    def get_tool_usage_summary(self) -> Dict[str, Any]:
+        """Get a summary of tool usage"""
+        return {
+            "total_calls": self.memory.tool_usage.total_tool_calls,
+            "successful_calls": self.memory.tool_usage.successful_tool_calls,
+            "failed_calls": self.memory.tool_usage.failed_tool_calls,
+            "success_rate": (
+                self.memory.tool_usage.successful_tool_calls
+                / max(1, self.memory.tool_usage.total_tool_calls)
+            )
+            * 100,
+            "tools_used": self.memory.tool_usage.tools_used,
+            "most_used_tool": (
+                max(
+                    self.memory.tool_usage.tools_used.items(),
+                    key=lambda x: x[1],
+                    default=("none", 0),
+                )[0]
+                if self.memory.tool_usage.tools_used
+                else "none"
+            ),
+        }
 
     class Config:
         """Pydantic configuration"""
