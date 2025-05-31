@@ -1,4 +1,4 @@
-# test_agent/llm/gemini.py
+# test_agent/llm/gemini.py - Fixed version
 
 import os
 import json
@@ -136,7 +136,7 @@ class GeminiProvider(LLMProvider):
 
         Args:
             prompt: The prompt to send to Gemini
-            system_prompt: Optional system prompt
+            system_prompt: Optional system prompt (will be prepended to user prompt for Gemini)
             temperature: Temperature setting (0.0 to 1.0)
             max_tokens: Maximum tokens to generate
             stream: Whether to stream the response
@@ -158,12 +158,13 @@ class GeminiProvider(LLMProvider):
 
         headers = {"Content-Type": "application/json"}
 
-        # Format content according to Gemini API
-        content = []
+        # Combine system prompt with user prompt since Gemini doesn't support system role
+        combined_prompt = prompt
         if system_prompt:
-            content.append({"role": "system", "parts": [{"text": system_prompt}]})
+            combined_prompt = f"{system_prompt}\n\n{prompt}"
 
-        content.append({"role": "user", "parts": [{"text": prompt}]})
+        # Format content according to Gemini API (no system role support)
+        content = [{"role": "user", "parts": [{"text": combined_prompt}]}]
 
         data = {"contents": content, "generationConfig": {"temperature": temperature}}
 
@@ -200,7 +201,7 @@ class GeminiProvider(LLMProvider):
         Args:
             prompt: The prompt to send to Gemini
             tools: List of tools available to Gemini
-            system_prompt: Optional system prompt
+            system_prompt: Optional system prompt (will be prepended to user prompt)
             temperature: Temperature setting (0.0 to 1.0)
             **kwargs: Additional Gemini-specific parameters
 
@@ -220,12 +221,13 @@ class GeminiProvider(LLMProvider):
 
         headers = {"Content-Type": "application/json"}
 
-        # Format content according to Gemini API
-        content = []
+        # Combine system prompt with user prompt since Gemini doesn't support system role
+        combined_prompt = prompt
         if system_prompt:
-            content.append({"role": "system", "parts": [{"text": system_prompt}]})
+            combined_prompt = f"{system_prompt}\n\n{prompt}"
 
-        content.append({"role": "user", "parts": [{"text": prompt}]})
+        # Format content according to Gemini API (no system role support)
+        content = [{"role": "user", "parts": [{"text": combined_prompt}]}]
 
         # Format tools for Gemini's API
         formatted_tools = []
@@ -325,5 +327,35 @@ class GeminiProvider(LLMProvider):
             return output_data
 
         # For dictionaries and other objects, convert to JSON
-
         return json.dumps(output_data)
+
+    def create_tool_calling_prompt(self, base_prompt: str, context: str = "") -> str:
+        """Create a prompt that encourages Gemini to use tools appropriately."""
+        if not self._tools:
+            return base_prompt
+
+        tool_descriptions = []
+        for tool_name, tool_info in self._tools.items():
+            tool_descriptions.append(
+                f"- {tool_name}: {tool_info.get('description', '')}"
+            )
+
+        enhanced_prompt = f"""
+You are an expert test fixing agent with access to the following tools:
+{chr(10).join(tool_descriptions)}
+
+{context}
+
+IMPORTANT: When you encounter issues that these tools can solve, USE THEM! For example:
+- If you see ImportError or ModuleNotFoundError, use install_python_package to install missing packages
+- If you need help with import statements, use fix_import_statement to get suggestions  
+- If external dependencies can't be installed, use create_mock_dependency to create mocks
+- Use run_test_command to verify that fixes work
+
+Don't just suggest what to do - actually use the tools to fix problems. After using tools successfully, then provide the corrected code or solution.
+
+{base_prompt}
+
+Please proceed with the task and actively use the available tools when they can help.
+"""
+        return enhanced_prompt

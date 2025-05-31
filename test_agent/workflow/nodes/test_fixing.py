@@ -1,13 +1,13 @@
-# test_agent/workflow/nodes/test_fixing.py - Enhanced with raw error details
+# test_agent/workflow/nodes/test_fixing.py - Enhanced version with better error context
 
 """
-Enhanced test fixing that passes raw stderr to AI agent for better error analysis.
+Enhanced test fixing that ensures ALL stderr is passed to AI agent for comprehensive error analysis.
 
 Key improvements:
-1. Extracts raw stderr from execution results
-2. For assertion errors and exceptions, passes full stderr context to AI
-3. For import errors, continues with structured approach + tools
-4. Better error categorization and context preservation
+1. Always includes full stderr context for ALL error types
+2. Better error categorization and context preservation
+3. Handles Gemini's lack of system prompt support
+4. More comprehensive error details extraction
 """
 
 import os
@@ -35,69 +35,62 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def extract_stderr_from_execution_result(execution_result: str) -> str:
+def extract_comprehensive_error_details(execution_result: str) -> Dict[str, str]:
     """
-    Extract just the stderr portion from execution result.
+    Extract ALL error details from execution result for comprehensive AI analysis.
 
     Args:
-        execution_result: Full execution result with STDOUT and STDERR sections
+        execution_result: Full execution result
 
     Returns:
-        Just the stderr content, or empty string if not found
+        Dictionary with all error details extracted
     """
     if not execution_result:
-        return ""
+        return {"stderr": "", "stdout": "", "full_output": "", "process_info": ""}
 
-    # Look for STDERR section
+    # Extract stderr section
     stderr_match = re.search(
         r"STDERR:\n(.*?)(?:\n\nPROCESS INFO:|$)", execution_result, re.DOTALL
     )
-    if stderr_match:
-        return stderr_match.group(1).strip()
+    stderr = stderr_match.group(1).strip() if stderr_match else ""
 
-    # Fallback - if no clear STDERR section, return the whole thing
-    # This handles cases where the format might be different
-    return execution_result
-
-
-def extract_stdout_from_execution_result(execution_result: str) -> str:
-    """
-    Extract just the stdout portion from execution result.
-
-    Args:
-        execution_result: Full execution result with STDOUT and STDERR sections
-
-    Returns:
-        Just the stdout content, or empty string if not found
-    """
-    if not execution_result:
-        return ""
-
-    # Look for STDOUT section
+    # Extract stdout section
     stdout_match = re.search(
         r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)", execution_result, re.DOTALL
     )
-    if stdout_match:
-        return stdout_match.group(1).strip()
+    stdout = stdout_match.group(1).strip() if stdout_match else ""
 
-    return ""
+    # Extract process info section
+    process_info_match = re.search(
+        r"PROCESS INFO:\n(.*?)$", execution_result, re.DOTALL
+    )
+    process_info = process_info_match.group(1).strip() if process_info_match else ""
+
+    return {
+        "stderr": stderr,
+        "stdout": stdout,
+        "full_output": execution_result,
+        "process_info": process_info,
+    }
 
 
-def analyze_test_error(execution_result: str) -> Dict[str, Any]:
+def analyze_test_error_comprehensive(execution_result: str) -> Dict[str, Any]:
     """
-    Enhanced error analysis that preserves raw error details.
+    Comprehensive error analysis that preserves ALL error details for AI.
 
     Args:
         execution_result: Test execution output
 
     Returns:
-        Dictionary with enhanced error analysis including raw details
+        Dictionary with comprehensive error analysis including ALL raw details
     """
     result = {
         "has_syntax_error": False,
         "has_import_error": False,
         "has_assertion_error": False,
         "has_exception": False,
+        "has_clear_error": False,
+        "test_failed_no_clear_error": False,
         "error_type": None,
         "error_message": None,
         "error_location": None,
@@ -105,30 +98,49 @@ def analyze_test_error(execution_result: str) -> Dict[str, Any]:
         "missing_dependencies": [],
         "failing_imports": [],
         "suggested_actions": [],
-        # New fields for raw error details
-        "raw_stderr": "",
-        "raw_stdout": "",
-        "detailed_error_context": "",
-        "should_use_raw_details": False,
+        # Enhanced fields for comprehensive error details
+        "error_details": {},
+        "comprehensive_context": "",
+        "should_use_tools_first": False,
+        "needs_stdout_analysis": False,
     }
 
     if not execution_result:
         return result
 
-    # Extract raw stderr and stdout
-    result["raw_stderr"] = extract_stderr_from_execution_result(execution_result)
-    result["raw_stdout"] = extract_stdout_from_execution_result(execution_result)
+    # Extract comprehensive error details
+    error_details = extract_comprehensive_error_details(execution_result)
+    result["error_details"] = error_details
+
+    # Create comprehensive context that includes EVERYTHING
+    context_parts = []
+
+    if error_details["stderr"]:
+        context_parts.append(f"=== STDERR OUTPUT ===\n{error_details['stderr']}")
+
+    if error_details["stdout"]:
+        context_parts.append(f"=== STDOUT OUTPUT ===\n{error_details['stdout']}")
+
+    if error_details["process_info"]:
+        context_parts.append(f"=== PROCESS INFO ===\n{error_details['process_info']}")
+
+    # Always include full output as fallback
+    context_parts.append(f"=== FULL EXECUTION OUTPUT ===\n{execution_result}")
+
+    result["comprehensive_context"] = "\n\n".join(context_parts)
 
     lines = execution_result.split("\n")
 
     # Check for import errors and extract missing modules
     if "ImportError" in execution_result or "ModuleNotFoundError" in execution_result:
         result["has_import_error"] = True
+        result["has_clear_error"] = True
         result["error_type"] = (
             "ImportError"
             if "ImportError" in execution_result
             else "ModuleNotFoundError"
         )
+        result["should_use_tools_first"] = True  # Use tools for import errors
 
         # Extract missing modules
         module_patterns = [
@@ -159,32 +171,19 @@ def analyze_test_error(execution_result: str) -> Dict[str, Any]:
             ):
                 result["failing_imports"].append(line.strip())
 
-        # For import errors, we can use structured approach
-        result["should_use_raw_details"] = False
-
     # Check for syntax errors
     elif "SyntaxError" in execution_result:
         result["has_syntax_error"] = True
+        result["has_clear_error"] = True
         result["error_type"] = "SyntaxError"
         result["suggested_actions"].append("fix_syntax")
-        # For syntax errors, raw details are very helpful
-        result["should_use_raw_details"] = True
-        result["detailed_error_context"] = result["raw_stderr"]
 
-    # Check for assertion errors - ENHANCED
+    # Check for assertion errors
     elif "AssertionError" in execution_result or "assert" in execution_result.lower():
         result["has_assertion_error"] = True
+        result["has_clear_error"] = True
         result["error_type"] = "AssertionError"
         result["suggested_actions"].append("fix_assertion")
-        # For assertion errors, we DEFINITELY need raw details
-        result["should_use_raw_details"] = True
-
-        # Extract detailed assertion context from stderr
-        stderr = result["raw_stderr"]
-        if stderr:
-            result["detailed_error_context"] = stderr
-        else:
-            result["detailed_error_context"] = execution_result
 
         # Try to extract specific assertion failure details
         assertion_patterns = [
@@ -200,11 +199,12 @@ def analyze_test_error(execution_result: str) -> Dict[str, Any]:
                 result["error_message"] = f"Assertion failed: {matches[0]}"
                 break
 
-    # Check for other exceptions - ENHANCED
+    # Check for other exceptions
     elif any(
         keyword in execution_result for keyword in ["Error:", "Exception:", "Traceback"]
     ):
         result["has_exception"] = True
+        result["has_clear_error"] = True
         if not result["error_type"]:
             # Try to extract specific exception type
             exception_match = re.search(r"(\w+Error): (.+)", execution_result)
@@ -215,15 +215,42 @@ def analyze_test_error(execution_result: str) -> Dict[str, Any]:
                 result["error_type"] = "Exception"
 
         result["suggested_actions"].append("fix_exception")
-        # For other exceptions, raw details are very helpful
-        result["should_use_raw_details"] = True
 
-        # Use stderr if available, otherwise full execution result
-        stderr = result["raw_stderr"]
-        if stderr and len(stderr.strip()) > 0:
-            result["detailed_error_context"] = stderr
-        else:
-            result["detailed_error_context"] = execution_result
+    # Check if test failed but no clear error was detected
+    if not result["has_clear_error"]:
+        # Look for test failure indicators in stdout/stderr
+        failure_indicators = [
+            "FAILED",
+            "FAIL",
+            "failed",
+            "failure",
+            "test failed",
+            "0 passed",
+            "1 failed",
+            "2 failed",
+            "3 failed",
+            "4 failed",
+            "5 failed",
+            "Exit code: 1",
+            "Return code: 1",
+            "❌",
+            "✗",
+        ]
+
+        # Check if any failure indicators are present
+        execution_lower = execution_result.lower()
+        if any(indicator in execution_lower for indicator in failure_indicators):
+            result["test_failed_no_clear_error"] = True
+            result["needs_stdout_analysis"] = True
+            result["error_type"] = "TestFailedNoErrorDetected"
+            result["error_message"] = (
+                "Test failed but no clear error type detected - needs stdout analysis"
+            )
+            result["suggested_actions"].append("analyze_stdout_for_failure")
+
+            logger.info(
+                "Test failed but no clear error detected - will analyze stdout/stderr comprehensively"
+            )
 
     return result
 
@@ -273,15 +300,15 @@ async def record_tool_call_from_llm_response(
         logger.warning(f"Error recording tool call from LLM response: {str(e)}")
 
 
-async def fix_test_with_iterative_approach(
+async def fix_test_with_comprehensive_approach(
     test_info: TestInfo,
     language: str,
     llm_provider,
     state: WorkflowState,
-    max_attempts: int = 5,
+    max_attempts: int = 2,
 ) -> TestInfo:
     """
-    Enhanced test fixing that uses raw error details for better context.
+    Enhanced test fixing with comprehensive error context and tool-first approach.
 
     Args:
         test_info: Test information
@@ -306,7 +333,7 @@ async def fix_test_with_iterative_approach(
         return test_info
 
     logger.info(
-        f"Starting enhanced iterative fix for test: {test_info.test_path} (attempt {test_info.fix_attempts + 1}/{max_attempts})"
+        f"Starting comprehensive fix for test: {test_info.test_path} (attempt {test_info.fix_attempts + 1}/{max_attempts})"
     )
 
     try:
@@ -323,19 +350,22 @@ async def fix_test_with_iterative_approach(
         tools_used_this_attempt = []
 
         # Iterative fixing loop
-        for iteration in range(3):  # Max 3 iterations per attempt
-            logger.info(f"Fix iteration {iteration + 1}/3 for {test_info.test_path}")
-
-            # Enhanced error analysis
-            error_analysis = analyze_test_error(current_execution_result)
+        for iteration in max_attempts:  # Max 3 iterations per attempt
             logger.info(
-                f"Error analysis: {error_analysis.get('error_type')} - Should use raw details: {error_analysis.get('should_use_raw_details')}"
+                f"Fix iteration {iteration + 1}/{max_attempts} for {test_info.test_path}"
             )
 
-            # Create system prompt based on error type
-            if error_analysis.get("has_import_error"):
-                system_prompt = """
-You are an expert test fixing agent with access to tools for resolving import and dependency issues.
+            # Comprehensive error analysis
+            error_analysis = analyze_test_error_comprehensive(current_execution_result)
+            logger.info(
+                f"Error analysis: {error_analysis.get('error_type')} - Should use tools first: {error_analysis.get('should_use_tools_first')}"
+            )
+
+            # Create unified prompt that works for all LLM providers
+            # For Gemini, we'll combine system and user prompts
+            if error_analysis.get("should_use_tools_first"):
+                # For import errors - tool-focused approach
+                base_system_content = """You are an expert test fixing agent with access to tools for resolving import and dependency issues.
 
 Available tools:
 - install_python_package: Install missing Python packages
@@ -344,73 +374,139 @@ Available tools:
 
 Your goal is to fix import/module errors by using tools to install missing dependencies or create appropriate mocks.
 
-Focus on using tools first, then provide code fixes if needed.
-"""
+Focus on using tools first, then provide code fixes if needed."""
+
+            elif error_analysis.get("test_failed_no_clear_error") or error_analysis.get(
+                "needs_stdout_analysis"
+            ):
+                # For tests that failed but no clear error detected - comprehensive analysis approach
+                base_system_content = """You are an expert test fixing agent specializing in analyzing test failures where no clear error is apparent.
+
+The test failed but there are no obvious ImportError, SyntaxError, AssertionError, or Exception messages. This means you need to carefully analyze the STDOUT and STDERR output to understand why the test failed.
+
+Common causes of "silent" test failures:
+1. Test logic issues (wrong assertions, incorrect expected values)
+2. Missing test data or setup
+3. Tests expecting different behavior than what the code provides
+4. Configuration or environment issues
+5. Silent failures in the test framework
+6. Tests that expect specific output but get different output
+7. Missing or incorrect mocks/fixtures
+8. Race conditions or timing issues
+
+Your approach:
+1. Carefully examine the STDOUT output for test execution results
+2. Look for any test framework output (pytest, unittest) that indicates what failed
+3. Analyze any assertion failures that might be buried in the output
+4. Check for missing expected values or incorrect actual values
+5. Look for test setup/teardown issues
+6. Examine the test code logic for potential issues
+
+Focus on providing specific code fixes based on what you find in the comprehensive output analysis."""
+
             else:
-                system_prompt = """
-You are an expert test fixing agent. I will provide you with detailed error information including the raw stderr output.
+                # For assertion/syntax/other errors - analysis-focused approach
+                base_system_content = """You are an expert test fixing agent. I will provide you with comprehensive error information including ALL raw output.
 
 Your goal is to analyze the specific error details and fix the test code accordingly.
 
 For assertion errors: Look at the specific assertion that failed and understand why it failed.
+For syntax errors: Identify the exact syntax issue and fix it.
 For other exceptions: Analyze the stack trace and exception details to understand the root cause.
 
-Focus on providing accurate code fixes based on the specific error details provided.
-"""
+Focus on providing accurate code fixes based on the specific error details provided."""
 
-            # Create detailed prompt - ENHANCED with raw error details
-            if error_analysis.get("should_use_raw_details") and error_analysis.get(
-                "detailed_error_context"
+            # Create detailed user prompt with COMPREHENSIVE error context
+            if error_analysis.get("test_failed_no_clear_error") or error_analysis.get(
+                "needs_stdout_analysis"
             ):
-                # Use raw error details for better context
-                error_details_section = f"""
-Raw Error Output (stderr):
-```
-{error_analysis.get('detailed_error_context')}
-```
-
-This is the actual error output from running the test. Please analyze this carefully to understand exactly what went wrong.
-"""
-            else:
-                # Use structured error analysis for import errors
-                error_details_section = f"""
-Error Analysis:
-- Error type: {error_analysis.get('error_type')}
-- Has import error: {error_analysis.get('has_import_error')}
-- Missing dependencies: {error_analysis.get('missing_dependencies')}
-- Suggested actions: {error_analysis.get('suggested_actions')}
-
-Full execution output:
-```
-{current_execution_result}
-```
-"""
-
-            user_prompt = f"""
-I need to fix a failing test. Here are the details:
+                # Special handling for tests that failed without clear errors
+                user_prompt = f"""I need to fix a failing test that has NO CLEAR ERROR MESSAGES. The test failed but there are no obvious ImportError, SyntaxError, AssertionError, or Exception traces.
 
 Test file: {os.path.basename(test_info.test_path)}
 Source file: {os.path.basename(test_info.source_file)}
 Fix iteration: {iteration + 1}/3
 Fix attempt: {test_info.fix_attempts + 1}/{max_attempts}
 
-{error_details_section}
+⚠️  CRITICAL: This test failed WITHOUT clear error indicators. You MUST analyze the STDOUT and STDERR output comprehensively to understand WHY it failed.
 
-Current test code:
+COMPREHENSIVE TEST OUTPUT (ANALYZE CAREFULLY):
+{error_analysis.get('comprehensive_context')}
+
+ANALYSIS SUMMARY:
+- Error type detected: {error_analysis.get('error_type')}
+- No clear ImportError, SyntaxError, or Exception detected
+- Test appears to have failed silently or with subtle issues
+- May require STDOUT analysis to identify the failure reason
+
+CURRENT TEST CODE:
 ```python
 {current_content}
 ```
 
 Tools already used this attempt: {tools_used_this_attempt}
 
-Please analyze the error and {'use appropriate tools to fix it' if error_analysis.get('has_import_error') else 'provide the corrected test code'}. 
+🔍 IMPORTANT ANALYSIS TASKS:
+1. Examine the STDOUT output for test framework messages (pytest/unittest output)
+2. Look for assertion failures that might be buried in the output
+3. Check for expected vs actual value mismatches
+4. Identify any test setup or logic issues
+5. Look for missing imports, fixtures, or test data
+6. Analyze test execution flow and identify where it might be failing
 
-{'Focus on installing missing packages or creating mocks for import errors.' if error_analysis.get('has_import_error') else 'Focus on understanding the specific failure and fixing the test logic, assertions, or setup.'}
+Based on your comprehensive analysis of the output above, provide the corrected test code that addresses the specific failure you identify. Focus on understanding WHY the test failed by analyzing the execution output."""
+
+            else:
+                # Standard handling for tests with clear errors
+                user_prompt = f"""I need to fix a failing test. Here are the comprehensive details:
+
+Test file: {os.path.basename(test_info.test_path)}
+Source file: {os.path.basename(test_info.source_file)}
+Fix iteration: {iteration + 1}/3
+Fix attempt: {test_info.fix_attempts + 1}/{max_attempts}
+
+COMPREHENSIVE ERROR CONTEXT:
+{error_analysis.get('comprehensive_context')}
+
+ERROR ANALYSIS:
+- Error type: {error_analysis.get('error_type')}
+- Has import error: {error_analysis.get('has_import_error')}
+- Has syntax error: {error_analysis.get('has_syntax_error')}
+- Has assertion error: {error_analysis.get('has_assertion_error')}
+- Has exception: {error_analysis.get('has_exception')}
+- Missing dependencies: {error_analysis.get('missing_dependencies')}
+- Suggested actions: {error_analysis.get('suggested_actions')}
+
+CURRENT TEST CODE:
+```python
+{current_content}
+```
+
+Tools already used this attempt: {tools_used_this_attempt}
+
+Please analyze the comprehensive error context above and {'use appropriate tools to fix the import/dependency issues' if error_analysis.get('should_use_tools_first') else 'provide the corrected test code based on the detailed error analysis'}.
+
+{'Focus on installing missing packages or creating mocks for import errors.' if error_analysis.get('should_use_tools_first') else 'Focus on understanding the specific failure from the stderr/stdout output and fixing the test logic, assertions, or setup accordingly.'}
 """
+
+            # Check if this is Gemini provider (which doesn't support system prompts)
+            is_gemini = (
+                hasattr(llm_provider, "provider_name")
+                and llm_provider.provider_name == "gemini"
+            )
+
+            if is_gemini:
+                # For Gemini, combine system and user prompts
+                combined_prompt = f"{base_system_content}\n\n{user_prompt}"
+                system_prompt = None
+            else:
+                # For other providers, use separate system prompt
+                combined_prompt = user_prompt
+                system_prompt = base_system_content
 
             # Use the LLM with tools to analyze and fix
             if hasattr(llm_provider, "generate_with_tools") and error_analysis.get(
-                "has_import_error"
+                "should_use_tools_first"
             ):
                 # For import errors, use tools
                 tools = None
@@ -418,16 +514,16 @@ Please analyze the error and {'use appropriate tools to fix it' if error_analysi
                     tools = llm_provider.get_bound_tools()
 
                 response = await llm_provider.generate_with_tools(
-                    prompt=user_prompt,
+                    prompt=combined_prompt,
                     tools=tools,
                     system_prompt=system_prompt,
                     temperature=0.1,
                 )
             else:
                 # For assertion/exception errors, focus on code generation
-                if error_analysis.get("has_import_error"):
+                if error_analysis.get("should_use_tools_first"):
                     enhanced_prompt = llm_provider.create_tool_calling_prompt(
-                        user_prompt,
+                        combined_prompt,
                         "Focus on using tools to fix import errors and missing dependencies.",
                     )
                     response = await llm_provider.generate(
@@ -439,7 +535,7 @@ Please analyze the error and {'use appropriate tools to fix it' if error_analysi
                 else:
                     # Direct code fixing for assertion/exception errors
                     response = await llm_provider.generate(
-                        user_prompt,
+                        combined_prompt,
                         system_prompt=system_prompt,
                         temperature=0.1,
                     )
@@ -600,15 +696,15 @@ Please analyze the error and {'use appropriate tools to fix it' if error_analysi
         return test_info
 
     except Exception as e:
-        logger.error(f"Error in iterative fix for {test_info.test_path}: {str(e)}")
-        test_info.error_message = f"Error in iterative fix: {str(e)}"
+        logger.error(f"Error in comprehensive fix for {test_info.test_path}: {str(e)}")
+        test_info.error_message = f"Error in comprehensive fix: {str(e)}"
         test_info.fix_attempts += 1
         return test_info
 
 
 async def fix_tests(state: WorkflowState) -> WorkflowState:
     """
-    Node to fix failing tests using enhanced iterative LLM approach with raw error details.
+    Node to fix failing tests using comprehensive error analysis.
 
     Args:
         state: Current workflow state
@@ -618,9 +714,7 @@ async def fix_tests(state: WorkflowState) -> WorkflowState:
     """
     language = state.project.language
 
-    logger.info(
-        f"Starting enhanced iterative test fixing phase for language: {language}"
-    )
+    logger.info(f"Starting comprehensive test fixing phase for language: {language}")
 
     # Get LLM provider
     if not state.llm or not state.llm.provider:
@@ -723,7 +817,7 @@ async def fix_tests(state: WorkflowState) -> WorkflowState:
         logger.info(f"Fixing test for {os.path.basename(source_file)}")
 
         try:
-            fixed_test_info = await fix_test_with_iterative_approach(
+            fixed_test_info = await fix_test_with_comprehensive_approach(
                 test_info, language, llm_provider, state
             )
             state.tests[source_file] = fixed_test_info
@@ -753,7 +847,7 @@ async def fix_tests(state: WorkflowState) -> WorkflowState:
 
     # Log summary with tool usage
     tool_summary = state.get_tool_usage_summary()
-    logger.info(f"Enhanced iterative test fixing complete in {time_taken:.2f}s")
+    logger.info(f"Comprehensive test fixing complete in {time_taken:.2f}s")
     logger.info(
         f"Test results - Passed: {passed}, Fixed: {fixed}, Failed: {failed}, Error: {error}, Skipped: {skipped}"
     )
