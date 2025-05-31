@@ -431,13 +431,28 @@ class GoAdapter(LanguageAdapter):
         test_filename = f"{source_base}_test{source_ext}"
 
         # Generate path based on location pattern
-        location_pattern = pattern.get("location_pattern", "same_directory")
+        location_pattern = pattern.get(
+            "location_pattern", "tests_subdirectory"
+        )  # Changed default
 
         if location_pattern == "same_directory":
             # Go standard is tests in the same directory
             return os.path.join(os.path.dirname(source_file), test_filename)
-        else:  # tests_directory
-            # Use test_directory - but need to match package structure
+        elif location_pattern == "tests_subdirectory":
+            # Create tests subdirectory in the same directory as the source file
+            test_dir = os.path.join(os.path.dirname(source_file), "tests")
+            os.makedirs(test_dir, exist_ok=True)
+            return os.path.join(test_dir, test_filename)
+        else:  # tests_directory or fallback - but now we prefer tests_subdirectory
+            source_dir = os.path.dirname(source_file)
+
+            # If the source file is not in the project root, use tests_subdirectory
+            if source_dir != project_root:
+                test_dir = os.path.join(source_dir, "tests")
+                os.makedirs(test_dir, exist_ok=True)
+                return os.path.join(test_dir, test_filename)
+
+            # For root-level files, use test_directory with package structure
             rel_path = os.path.relpath(os.path.dirname(source_file), project_root)
             test_path = os.path.join(test_directory, rel_path)
             os.makedirs(test_path, exist_ok=True)
@@ -610,12 +625,21 @@ func TestTableDriven(t *testing.T) {
         # Generate test file name (Go standard pattern)
         test_name = f"{source_base}_test{source_ext}"
 
-        # Check in the same directory (Go standard)
-        test_path = os.path.join(source_dir, test_name)
-        if os.path.exists(test_path):
-            return test_path
+        # Check in different locations, prioritizing tests subdirectory
+        potential_locations = [
+            os.path.join(source_dir, "tests"),  # tests/ subdirectory (PRIORITY)
+            source_dir,  # Same directory (Go standard)
+            os.path.join(source_dir, "test"),  # test/ subdirectory
+        ]
 
-        # Check in a test directory with the same relative path
+        # Check each location
+        for location in potential_locations:
+            if os.path.exists(location):
+                test_path = os.path.join(location, test_name)
+                if os.path.exists(test_path):
+                    return test_path
+
+        # Check in test directories with matching directory structure
         test_dirs = []
 
         # Look for test directories in project
