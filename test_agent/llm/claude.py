@@ -125,38 +125,6 @@ class ClaudeProvider(LLMProvider):
 
         return llm
 
-    async def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-        temperature: float = 0.2,
-        max_tokens: Optional[int] = None,
-        stream: bool = False,
-        use_tools: bool = False,
-        **kwargs,
-    ) -> Union[str, Any]:
-        """Generate text using Claude's API with optional tool usage."""
-        if use_tools and self._tools:
-            # Use tool-enabled generation
-            tools = self.get_bound_tools()
-            return await self.generate_with_tools(
-                prompt=prompt,
-                tools=tools,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                **kwargs,
-            )
-        else:
-            # Regular generation
-            return await self._generate_without_tools(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=stream,
-                **kwargs,
-            )
-
     async def _generate_without_tools(
         self,
         prompt: str,
@@ -183,18 +151,19 @@ class ClaudeProvider(LLMProvider):
             "content-type": "application/json",
         }
 
+        # FIXED: Always provide max_tokens with a reasonable default
+        effective_max_tokens = max_tokens or 4000
+
         data = {
             "model": model,
             "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
             "stream": stream,
+            "max_tokens": effective_max_tokens,  # Always include max_tokens
         }
 
         if system_prompt:
             data["system"] = system_prompt
-
-        if max_tokens:
-            data["max_tokens"] = max_tokens
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -211,6 +180,43 @@ class ClaudeProvider(LLMProvider):
                 else:
                     result = await response.json()
                     return result["content"][0]["text"]
+
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        stream: bool = False,
+        use_tools: bool = False,
+        **kwargs,
+    ) -> Union[str, Any]:
+        """Generate text using Claude's API with optional tool usage."""
+
+        # FIXED: Ensure max_tokens has a default value
+        effective_max_tokens = max_tokens or 4000
+
+        if use_tools and self._tools:
+            # Use tool-enabled generation
+            tools = self.get_bound_tools()
+            return await self.generate_with_tools(
+                prompt=prompt,
+                tools=tools,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=effective_max_tokens,  # Pass the effective max_tokens
+                **kwargs,
+            )
+        else:
+            # Regular generation
+            return await self._generate_without_tools(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=effective_max_tokens,  # Pass the effective max_tokens
+                stream=stream,
+                **kwargs,
+            )
 
     async def generate_with_tools(
         self,
